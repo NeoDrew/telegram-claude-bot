@@ -141,7 +141,6 @@ PYEOF
         fi
         ;;
       *)
-        echo "Usage: /schedule [list|clear|remove <id>]
-Bare /schedule lists with buttons. /schedule clear wipes all. /schedule remove <prefix> kills one."
+        echo "Unknown schedule option. Open 📅 schedule from ⚙️ more options to see and remove tasks."
         ;;
     esac

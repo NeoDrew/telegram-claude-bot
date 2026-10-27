@@ -290,8 +290,18 @@ start_spawn() {
       # loop would restart. Tripping the breaker means "stop retrying".
       : > "$rd/queue.jsonl"
       : > "$crash_file"
-      CHAT_ID="$chat_id" "$SCRIPTS/tg.sh" send "⚡ Session reset after repeated crashes. Starting fresh, please resend your message." >>"$LOG" 2>&1 || true
-      return
+      # Retry the message being sent now, once, in the fresh session.
+      # BUG FIXED: the breaker used to drop it and ask the user to resend.
+      # A second trip within 10 minutes means the message itself is likely
+      # the problem, so that one stops for real.
+      local last_trip
+      last_trip=$(cat "$rd/.breaker_tripped_at" 2>/dev/null)
+      echo "$now_s" > "$rd/.breaker_tripped_at"
+      if [[ -z "$user_text" ]] || { [[ "$last_trip" =~ ^[0-9]+$ ]] && (( now_s - last_trip < 600 )); }; then
+        CHAT_ID="$chat_id" "$SCRIPTS/tg.sh" send "⚡ Claude keeps crashing, even in a fresh session, so I've stopped retrying. Send your message again when you're ready, or try rephrasing it." >>"$LOG" 2>&1 || true
+        return
+      fi
+      CHAT_ID="$chat_id" "$SCRIPTS/tg.sh" send "⚡ Claude kept crashing, so I've started a fresh session and I'm retrying your message there." >>"$LOG" 2>&1 || true
     fi
     # Prune in place so the file doesn't grow forever.
     local tmp
@@ -330,7 +340,7 @@ start_spawn() {
     if [[ -f "$rd/.inbox_ready" ]]; then
       inject_to_inbox "$user_text" "$chat_id" "$msg_ids"
     else
-      printf '%s\n' "${user_text//$'\n'/$'\x1e'}" >> "$rd/queue.jsonl"
+      queue_line "$user_text" "$msg_ids" >> "$rd/queue.jsonl"
     fi
     return
   fi
@@ -351,7 +361,7 @@ start_spawn() {
       inject_to_inbox "/compact" "$chat_id"   # synthetic, no message to react to
       touch "$rd/.compact_in_flight"
     fi
-    inject_to_inbox "$user_text" "$chat_id" "$msg_ids"
+    [[ -n "$user_text" ]] && inject_to_inbox "$user_text" "$chat_id" "$msg_ids"
     touch "$rd/.inbox_ready"
     preseeded=1
   fi
@@ -541,6 +551,18 @@ drain_queue_if_idle() {
       fi
     fi
     qf="$rd/queue.jsonl"
+    if [[ ! -s "$qf" && -f "$rd/.compact_pending" ]] \
+        && [[ -z "$(python3 "$SCRIPTS/room_state.py" get-session "$rd/sessions.json" 2>/dev/null)" ]]; then
+      rm -f "$rd/.compact_pending" "$rd/.compact_in_flight"   # no conversation to compress
+    fi
+    if [[ ! -s "$qf" && -f "$rd/.compact_pending" ]]; then
+      # 🗜 tapped in an idle chat: start Claude just to compress, now,
+      # rather than making the next message wait through it. start_spawn
+      # injects the /compact first and, with no message, nothing after.
+      log "  compact-only spawn chat=$chat_id"
+      start_spawn "" "$chat_id"
+      continue
+    fi
     [[ -s "$qf" ]] || continue
     # Atomic claim: rename the queue out from under any concurrent dispatch
     # before reading. A `dispatch` running on the next iteration that
@@ -561,14 +583,13 @@ drain_queue_if_idle() {
     # with letters missing). ${VAR//pat/repl} is what other call sites in
     # this file already use safely for the identical substitution; this call
     # site was the one inconsistent spot still piping through external tr.
-    combined=$(awk 'NF{print; print ""}' "$draining" | sed -e '$d')
-    combined="${combined//$'\x1e'/$'\n'}"
+    read_queue "$draining"
     count=$(grep -c . "$draining" 2>/dev/null || echo 0)
     rm -f "$draining"
-    [[ -z "$combined" ]] && continue
+    [[ -z "$QTEXT" ]] && continue
     log "  dequeue chat=$chat_id: ${count} message(s) coalesced"
     emit_metric dequeue room="$chat_id" count="$count"
-    start_spawn "$combined" "$chat_id"
+    start_spawn "$QTEXT" "$chat_id" "$QIDS"
   done
 }
 
@@ -603,8 +624,8 @@ drain_inject_burst() {
       continue
     fi
     : > "$bf"
-    combined=$(awk 'NF{print; print ""}' "$draining" | sed -e '$d')
-    combined="${combined//$'\x1e'/$'\n'}"
+    read_queue "$draining"
+    combined="$QTEXT"
     count=$(grep -c . "$draining" 2>/dev/null || echo 0)
     rm -f "$draining"
     [[ -z "$combined" ]] && continue
@@ -615,7 +636,7 @@ drain_inject_burst() {
         log "  context full chat=$chat_id: compressing before the message"
         inject_to_inbox "/compact" "$chat_id"
       fi
-      inject_to_inbox "$combined" "$chat_id"
+      inject_to_inbox "$combined" "$chat_id" "$QIDS"
     else
       # The spawn this burst was waiting on died or tore down mid-window
       # (a /cancel, a crash, a rate-limit hold), rare, but the content
@@ -624,7 +645,7 @@ drain_inject_burst() {
       # up and deliver it as a fresh turn once the room is actually ready
       # for one, same "never silently lost" guarantee every other queue
       # path in this file already gives.
-      printf '%s\n' "${combined//$'\n'/$'\x1e'}" >> "$rd/queue.jsonl"
+      queue_line "$combined" "$QIDS" >> "$rd/queue.jsonl"
       log "  inject-debounce fallback chat=$chat_id: room state changed, requeued ${count} message(s)"
     fi
   done
@@ -710,6 +731,32 @@ print(classify(Path(os.environ['ROOM_DIR'])).get('state', ''))
 # stale entry that misattributes a later turn's reaction to the wrong
 # message, it just degrades to "reaction never updates" for that one
 # message, exactly today's behaviour, never a wrong-message update.
+# queue_line <text> [msg_ids]: one line for queue.jsonl or .inject_burst.jsonl.
+# Newlines are stored as \x1e; the Telegram message ids the text carries
+# follow a \x1f (which Telegram text never contains: the parser splits
+# updates on it), so the drain can hand them on and the streamer can move
+# those messages to 👀 when Claude reads them and 👍 when it has answered.
+# BUG FIXED: queued messages (idle-chat debounce, Claude starting or
+# stopping, a rate-limit hold) used to lose their ids, so their reaction
+# never changed and the first message to an idle chat got none at all.
+queue_line() {
+  local t="${1//$'\n'/$'\x1e'}"
+  if [[ -n "${2:-}" ]]; then
+    printf '%s\x1f%s\n' "$t" "$2"
+  else
+    printf '%s\n' "$t"
+  fi
+}
+
+# read_queue <file>: QTEXT = the lines coalesced with blank-line separators
+# (newlines restored), QIDS = every message id they carry, space separated.
+read_queue() {
+  QIDS=$(awk -F$'\x1f' 'NF > 1 { printf "%s ", $2 }' "$1")
+  QIDS="${QIDS% }"
+  QTEXT=$(awk -F$'\x1f' '$1 != "" { print $1; print "" }' "$1" | sed -e '$d')
+  QTEXT="${QTEXT//$'\x1e'/$'\n'}"
+}
+
 # context_full <chat_id>: true when the room's last turn left the context at
 # or above its compaction threshold (the room's autocompact setting, else
 # PRECOMPACT_PCT). Consumes the reading, so one burst compacts once. Only
@@ -1164,7 +1211,7 @@ print(classify(Path(os.environ['ROOM_DIR'])).get('state', ''))
         # fresh spawn. drain_inject_burst (paired with drain_queue_if_idle)
         # flushes the whole coalesced burst as ONE inject_to_inbox call
         # once the window elapses.
-        printf '%s\n' "${outgoing//$'\n'/$'\x1e'}" >> "$ROOMS_DIR/$chat_id/.inject_burst.jsonl"
+        queue_line "$outgoing" "${USER_MSG_ID:-}" >> "$ROOMS_DIR/$chat_id/.inject_burst.jsonl"
         echo "$(( $(date +%s) + DEBOUNCE_WINDOW_S ))" > "$ROOMS_DIR/$chat_id/.inject_debounce_until"
         log "  buffered chat=$chat_id (inject debounce, between turns)"
       else
@@ -1195,7 +1242,7 @@ print(classify(Path(os.environ['ROOM_DIR'])).get('state', ''))
       # Queue it instead; drain_queue_if_idle coalesces and spawns it the
       # moment the room frees up. The queue is line-oriented, so embedded
       # newlines are stored as \x1e and restored by the drain.
-      printf '%s\n' "${outgoing//$'\n'/$'\x1e'}" >> "$ROOMS_DIR/$chat_id/queue.jsonl"
+      queue_line "$outgoing" "${USER_MSG_ID:-}" >> "$ROOMS_DIR/$chat_id/queue.jsonl"
       log "  queued chat=$chat_id (busy, inbox not ready)"
       # Distinct from 👀: this message ISN'T in front of claude yet, it's
       # sitting in queue.jsonl until the drain picks it up once the room
@@ -1221,7 +1268,7 @@ print(classify(Path(os.environ['ROOM_DIR'])).get('state', ''))
     # just crash on the same limit, so queue the message for the
     # auto-resume and acknowledge with a sleepy react (the alert already
     # told the user when the room wakes up).
-    printf '%s\n' "${outgoing//$'\n'/$'\x1e'}" >> "$ROOMS_DIR/$chat_id/queue.jsonl"
+    queue_line "$outgoing" "${USER_MSG_ID:-}" >> "$ROOMS_DIR/$chat_id/queue.jsonl"
     log "  queued chat=$chat_id (rate-limit hold)"
     if [[ -n "${USER_MSG_ID:-}" ]]; then
       CHAT_ID="$chat_id" "$SCRIPTS/tg.sh" react "$USER_MSG_ID" "😴" 2>/dev/null || true
@@ -1241,9 +1288,14 @@ print(classify(Path(os.environ['ROOM_DIR'])).get('state', ''))
     # separate messages: without it, each fragment spawned its own turn,
     # claude answering a sentence cut off mid-thought before the rest of
     # it had even arrived.
-    printf '%s\n' "${outgoing//$'\n'/$'\x1e'}" >> "$ROOMS_DIR/$chat_id/queue.jsonl"
+    queue_line "$outgoing" "${USER_MSG_ID:-}" >> "$ROOMS_DIR/$chat_id/queue.jsonl"
     echo "$(( $(date +%s) + DEBOUNCE_WINDOW_S ))" > "$ROOMS_DIR/$chat_id/.debounce_until"
     log "  buffered chat=$chat_id (debounce window, room was idle)"
+    # Acknowledge at once: the reply starts after the short quiet period
+    # (plus a cold start), and a message with no reaction looks unseen.
+    if [[ -n "${USER_MSG_ID:-}" ]]; then
+      CHAT_ID="$chat_id" "$SCRIPTS/tg.sh" react "$USER_MSG_ID" "👀" 2>/dev/null || true
+    fi
   fi
 }
 

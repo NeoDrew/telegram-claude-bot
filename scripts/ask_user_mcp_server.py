@@ -41,8 +41,16 @@ def tg_post(endpoint, **kwargs):
 def html_escape(s):
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+EXPIRED_NOTE = ("\n\n⌛ <i>No answer within 5 minutes, so Claude carried on without it. "
+                "Send a message if you still want to answer.</i>")
+
+
+def question_text(prompt):
+    return f"<b>Claude needs your input:</b>\n\n{html_escape(prompt)}"
+
+
 def send_question(prompt, options):
-    text = f"<b>Claude needs your input:</b>\n\n{html_escape(prompt)}"
+    text = question_text(prompt)
     rows = []
     for i, opt in enumerate(options):
         # Use index-based callback_data to stay within Telegram's 64-byte limit.
@@ -94,6 +102,12 @@ def handle_ask_user(arguments):
         PENDING.unlink()
     except OSError:
         pass
+    # Say so on the question itself and take the buttons away. BUG FIXED:
+    # they used to stay, looking live, and a tap did nothing visible.
+    if msg_id:
+        tg_post("editMessageText", chat_id=CHAT_ID, message_id=msg_id,
+                text=question_text(prompt) + EXPIRED_NOTE, parse_mode="HTML",
+                reply_markup={"inline_keyboard": []})
     return "[no response, question timed out after 5 minutes]"
 
 TOOL_DEF = {
@@ -162,4 +176,5 @@ def main():
             if rid is not None:
                 err(rid, -32601, f"Unknown method: {method}")
 
-main()
+if __name__ == "__main__":
+    main()

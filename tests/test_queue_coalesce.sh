@@ -23,11 +23,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/.." && pwd)"
 . "$HERE/lib_assert.sh"
 
-SNIPPET=$(awk '
-  /# Coalesce one message per physical line/ { grab=1 }
-  grab { print }
-  grab && /combined="\$\{combined/ { exit }
-' "$REPO_ROOT/scripts/listener.sh")
+# The coalescing lives in listener.sh's read_queue (with queue_line, which
+# writes the lines); extract both functions as they are in the file.
+SNIPPET=$(sed -n '/^queue_line() {/,/^}/p;/^read_queue() {/,/^}/p' "$REPO_ROOT/scripts/listener.sh")
 
 if [[ -z "$SNIPPET" ]]; then
   _fail "extract coalescing snippet from listener.sh" \
@@ -50,9 +48,9 @@ trap 'rm -f "$RUNNER"' EXIT
 run_coalesce() {
   local draining="$1"
   {
-    echo 'draining="$1"'
     printf '%s\n' "$SNIPPET"
-    echo 'printf "%s" "$combined"'
+    echo 'read_queue "$1"'
+    echo 'printf "%s" "$QTEXT"'
   } > "$RUNNER"
   bash "$RUNNER" "$draining"
 }
@@ -85,5 +83,16 @@ got=$(run_coalesce "$draining")
 rm -f "$draining"
 assert_eq "embedded newline (the real \\x1e use case) still restored" \
   "$(printf 'line one\nline two')" "$got"
+
+# Case 4: queued lines carry their Telegram message ids after a \x1f
+# (queue_line); the text must not show them, and read_queue must collect
+# every id so the drained messages' reactions can still resolve.
+draining=$(mktemp)
+printf 'first\x1f11\nno ids here\nthird\x1f12 13\n' > "$draining"
+got=$(run_coalesce "$draining")
+ids=$({ printf '%s\n' "$SNIPPET"; echo 'read_queue "$1"'; echo 'printf "%s" "$QIDS"'; } > "$RUNNER"; bash "$RUNNER" "$draining")
+rm -f "$draining"
+assert_eq "ids stay out of the coalesced text" "$(printf 'first\n\nno ids here\n\nthird')" "$got"
+assert_eq "every carried id is collected" "11 12 13" "$ids"
 
 finish

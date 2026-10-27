@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
 E2E: the crash-loop circuit breaker (scripts/listener.sh's start_spawn,
-".crash_times" check). Trips and resets the room after >=3 crashes within
-60 real seconds, truncating BOTH inbox and queue ("tripping means stop
-retrying" per CLAUDE.md).
+".crash_times" check). Trips after >=3 crashes within 60 real seconds,
+resets the session and truncates inbox and queue, then retries the message
+it was about to send ONCE in the fresh session. BUG FIXED: it used to drop
+that message and ask the user to resend. A second trip within 10 minutes
+stops for real (the message itself is likely the problem).
+
+  1. recovers: three crashes, then the fresh session answers the message
+  2. keeps crashing: the second trip stops retrying and everything goes quiet
 
 This test sends exactly ONE user message and scripts several consecutive
 crash turns. A crash's own exit handler salvages the never-answered inbox
@@ -23,74 +28,23 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from harness import E2EHarness, write_fake_claude_script, DM_CHAT_ID  # noqa: E402
 
 
-def main():
-    h = E2EHarness(label="circuit-breaker")
+def run_case(label, turns, check):
+    h = E2EHarness(label=label)
     fd, script_path = tempfile.mkstemp(suffix=".json", prefix="fake-claude-script-")
     os.close(fd)
-    # Enough consecutive crash turns for the auto-retry loop to reach 3
-    # crashes within 60s even if a couple of retries land in the same
-    # short-poll cycle. If the breaker logic is broken this fixture would
-    # otherwise just crash forever with no natural end state to assert on.
-    write_fake_claude_script(script_path, [{"crash": True, "exit_code": 1}] * 8)
+    write_fake_claude_script(script_path, turns)
     try:
         h.setup(fake_claude_script=script_path,
                 extra_env={"BOT_DRAFT_STREAMING": "0"})
         h.start_listener()
-
-        t0 = time.time()
         h.inject_dm("this message will keep crashing")
-
-        breaker_msg = h.wait_for_call(
-            "sendMessage",
-            lambda p: "repeated crashes" in p.get("text", ""),
-            timeout=90)
-        elapsed = time.time() - t0
-        print(f"ok: circuit breaker tripped after {elapsed:.1f}s")
-        print(f"  text={breaker_msg['params'].get('text', '')!r}")
-
-        assert elapsed < 60, (
-            f"breaker tripped at {elapsed:.1f}s but the crash-count window "
-            f"is 60s wide, if this consistently lands over ~60s the retry "
-            f"cadence may be too slow to ever trip the breaker in practice")
-
-        crash_alerts = h.all_calls("sendMessage")
-        real_crash_count = sum(
-            1 for c in crash_alerts
-            if "crashed (exit" in c["params"].get("text", ""))
-        print(f"info: {real_crash_count} individual crash alerts fired "
-              f"before the breaker tripped")
-        assert real_crash_count >= 3, (
-            f"breaker is supposed to require >=3 crashes, but only "
-            f"{real_crash_count} individual crash alerts were observed "
-            f"(it may be tripping on fewer than the documented threshold)")
-
-        # Tripping means "stop retrying": both files must be empty after.
-        inbox = h.read_room_file(DM_CHAT_ID, "inbox.ndjson", default="")
-        queue = h.read_room_file(DM_CHAT_ID, "queue.jsonl", default="")
-        assert inbox.strip() == "", f"expected inbox truncated, got {inbox!r}"
-        assert queue.strip() == "", f"expected queue truncated, got {queue!r}"
-        print("ok: inbox.ndjson and queue.jsonl both truncated after trip")
-
-        sid = h.read_room_json(DM_CHAT_ID, "sessions.json", default={}).get("session_id")
-        assert not sid, f"expected session_id cleared after breaker trip, got {sid!r}"
-        print("ok: session_id cleared after breaker trip")
-
-        # Confirm the loop actually STOPPED: no new crash alert should show
-        # up if we wait past another retry cadence.
-        before_count = len(h.all_calls("sendMessage"))
-        time.sleep(6)
-        after_count = len(h.all_calls("sendMessage"))
-        assert after_count == before_count, (
-            f"breaker tripped but the room kept spawning anyway: "
-            f"{before_count} -> {after_count} sendMessage calls in the "
-            f"6s after trip")
-        print("ok: no further spawn activity after the breaker tripped")
-
+        check(h)
+        return True
     except Exception:
         import traceback
         traceback.print_exc()
         h.keep_sandbox = True
-        sys.exit(1)
+        return False
     finally:
         h.teardown()
         os.unlink(script_path)
@@ -98,8 +52,48 @@ def main():
         if os.path.exists(state_path):
             os.unlink(state_path)
 
-    print("\nok: circuit breaker trips on a real compounding crash loop "
-          "and actually stops it")
+
+def check_recovers(h):
+    t0 = time.time()
+    h.wait_for_call("sendMessage",
+                    lambda p: "retrying your message" in p.get("text", ""), timeout=90)
+    print(f"ok: breaker tripped after {time.time() - t0:.1f}s and retries in a fresh session")
+    crashes = sum(1 for c in h.all_calls("sendMessage")
+                  if "stopped unexpectedly" in c["params"].get("text", ""))
+    assert crashes >= 3, f"breaker needs >=3 crashes, saw {crashes}"
+    h.wait_for_call("editMessageText",
+                    lambda p: "answered in the fresh session" in p.get("text", ""), timeout=30)
+    print("ok: the message was answered in the fresh session, not dropped")
+
+
+def check_gives_up(h):
+    h.wait_for_call("sendMessage",
+                    lambda p: "retrying your message" in p.get("text", ""), timeout=90)
+    print("ok: first trip retries in a fresh session")
+    h.wait_for_call("sendMessage",
+                    lambda p: "stopped retrying" in p.get("text", ""), timeout=120)
+    print("ok: second trip within 10 minutes stops for real")
+    inbox = h.read_room_file(DM_CHAT_ID, "inbox.ndjson", default="")
+    queue = h.read_room_file(DM_CHAT_ID, "queue.jsonl", default="")
+    assert inbox.strip() == "" and queue.strip() == "", (inbox, queue)
+    before = len(h.all_calls("sendMessage"))
+    time.sleep(6)
+    assert len(h.all_calls("sendMessage")) == before, "the room kept spawning after giving up"
+    print("ok: inbox and queue empty, no further activity")
+
+
+def main():
+    crash = {"crash": True, "exit_code": 1}
+    results = {
+        "recovers_in_fresh_session": run_case(
+            "circuit-breaker-recovers", [crash] * 3 + [{"text": "answered in the fresh session"}],
+            check_recovers),
+        "gives_up_on_second_trip": run_case(
+            "circuit-breaker-gives-up", [crash] * 10, check_gives_up),
+    }
+    for name, ok in results.items():
+        print(("PASS " if ok else "FAIL ") + name)
+    sys.exit(0 if all(results.values()) else 1)
 
 
 if __name__ == "__main__":

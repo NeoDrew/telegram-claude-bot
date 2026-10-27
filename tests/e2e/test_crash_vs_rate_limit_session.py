@@ -97,7 +97,7 @@ def case_single_crash_preserves_session():
         h.inject_dm("please do work")
 
         crash_alert = h.wait_for_call(
-            "sendMessage", lambda p: "crashed" in p.get("text", "").lower(),
+            "sendMessage", lambda p: "stopped unexpectedly" in p.get("text", "").lower(),
             timeout=20)
         print(f"ok: crash alert sent: {crash_alert['params'].get('text', '')!r}")
 

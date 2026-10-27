@@ -86,7 +86,7 @@ def main():
 
         new_crash_alerts = [
             c for c in h.all_calls("sendMessage")[calls_before_restart:]
-            if "crashed" in c["params"].get("text", "").lower()
+            if "stopped unexpectedly" in c["params"].get("text", "").lower()
             or "Rate limited" in c["params"].get("text", "")]
         assert not new_crash_alerts, (
             f"the fresh listener process retried into a NEW failure while "

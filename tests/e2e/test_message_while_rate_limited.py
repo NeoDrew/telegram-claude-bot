@@ -62,7 +62,7 @@ def main():
             c for c in new_calls_since
             if c["method"] == "sendMessage"
             and ("Rate limited" in c["params"].get("text", "")
-                 or "crashed" in c["params"].get("text", "").lower())]
+                 or "stopped unexpectedly" in c["params"].get("text", "").lower())]
         assert not new_crash_or_park, (
             f"a message sent mid-hold must be queued, not spawned into a "
             f"doomed retry: {new_crash_or_park}")

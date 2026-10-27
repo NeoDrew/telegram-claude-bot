@@ -111,9 +111,8 @@ sys.path.insert(0, os.path.join(os.environ['REPO_ROOT'], 'scripts'))
 from model_effort import OPTIONS
 print(', '.join(a for _l, a, _f in OPTIONS) + ', opus48')
 ")
-      echo "Unknown model '$ARGS'. Use an alias or full claude-* model ID.
-Aliases: $ALIAS_LIST
-Examples: /model fable, /model claude-opus-4-8[1m], /model default"
+      echo "Unknown model '$ARGS'.
+Pick one from the 🧠 model and effort button in the menu. Aliases: $ALIAS_LIST"
       exit 0
     fi
     [[ "$MODEL" != "$CUR_MODEL" ]] && reset_effort_for_model_change

@@ -162,7 +162,7 @@ PYEOF
     # first (frontmost, z-order) match is ours.
     VENV_PY="$REPO_ROOT/.venv/bin/python3"
     if [[ ! -x "$VENV_PY" ]]; then
-      echo "/tab needs the venv at .venv/. Run: python3 -m venv .venv && .venv/bin/pip install pyobjc-framework-Quartz"
+      echo "🔖 Tab screenshots aren't set up on the Mac yet. Running scripts/install.sh there once enables them."
       exit 0
     fi
     WID=$("$VENV_PY" "$REPO_ROOT/scripts/enum_windows.py" 2>/dev/null \

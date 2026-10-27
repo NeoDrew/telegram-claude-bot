@@ -18,7 +18,7 @@
     # separate messages below it.
     VENV_PY="$REPO_ROOT/.venv/bin/python3"
     if [[ ! -x "$VENV_PY" ]]; then
-      echo "Windows capture needs the venv at .venv/. Run: python3 -m venv .venv && .venv/bin/pip install pyobjc-framework-Quartz"
+      echo "🪟 Window screenshots aren't set up on the Mac yet. Running scripts/install.sh there once enables them."
       exit 0
     fi
 
@@ -66,7 +66,7 @@
     if [[ "$N" -eq 0 ]]; then
       echo "summary enumerated=$ENUM captured=0 sent=0" >>"$WIN_LOG"
       rm -rf "$WORKDIR"
-      echo "🪟 No windows captured (enumerated $ENUM). Either nothing is open, or Screen Recording permission is missing for the bot's launchd context. See logs/windows.log."
+      echo "🪟 No windows captured. Either nothing is open, or the Mac hasn't given the bot Screen Recording permission (System Settings, Privacy & Security, Screen Recording)."
       exit 0
     fi
 
@@ -126,7 +126,7 @@
       # assert a cause here (the real Telegram error is in logs/windows.log);
       # a bad-dimension capture, an oversized photo, and a network drop all
       # land here, so a guessed cause would often be wrong.
-      echo "🪟 Captured $N windows but Telegram accepted none of the uploads. The API error is in logs/windows.log. Try again."
+      echo "🪟 Captured $N windows, but Telegram didn't accept the uploads. Try again in a moment."
     else
-      echo "🪟 Sent $SENT of $N windows; Telegram rejected the rest (see logs/windows.log). Try again for the missing ones."
+      echo "🪟 Sent $SENT of $N windows; Telegram didn't accept the rest. Try again for the missing ones."
     fi

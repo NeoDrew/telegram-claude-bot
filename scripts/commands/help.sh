@@ -22,4 +22,14 @@ This bot is Claude Code running on your Mac. Message it the way you'd talk to Cl
 **How to drive it**
 
 Just type a message and it goes straight to Claude. Tap /menu for everything as buttons: status, switch folder, model, effort, screenshots, usage, scheduling, and more.
+
+**Reading the chat**
+
+- 🫡 your message is queued; Claude is busy and will get to it.
+- 👀 Claude has read it.
+- 👍 Claude has answered it.
+- 😴 a usage limit is on; it will be answered automatically when the limit resets.
+- ⏱ "Worked for…" after a reply: how long it took and how full the conversation's memory is. Near full it compresses itself, and shows 🗜 while it does.
+- Buttons in a question from Claude: tap one to answer. They expire after 5 minutes.
+- 🛑 cancel stops the current reply; anything you sent after it is still answered.
 EOF

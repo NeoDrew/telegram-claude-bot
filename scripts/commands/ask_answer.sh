@@ -19,13 +19,25 @@
 PENDING_FILE="$ROOM_DIR/.ask_user_pending.json"
 ANSWER_FILE="$ROOM_DIR/.ask_user_answer"
 
-if [[ ! -f "$PENDING_FILE" ]]; then
-  # No pending question: stale button tap or race.
+expire_tapped_question() {
+  # A tap on a question Claude is no longer waiting for (timed out, or the
+  # reply was interrupted). Used to do nothing visible; now it says so and
+  # removes the buttons.
+  [[ -n "${CALLBACK_MSG_ID:-}" ]] && reply_kb "⌛ This question has expired; Claude carried on without an answer. Send a message if you still want to answer it." "[]" 0
   exit 0
-fi
+}
+
+[[ -f "$PENDING_FILE" ]] || expire_tapped_question
 
 # Read pending data FIRST so a fast MCP server can't delete it before us.
 PENDING_DATA=$(cat "$PENDING_FILE" 2>/dev/null || echo '{}')
+# A button from an OLDER question must not answer the one pending now.
+PENDING_MSG_ID=$(printf '%s' "$PENDING_DATA" | python3 -c "import json,sys
+try: print(json.loads(sys.stdin.read()).get('msg_id') or '')
+except Exception: print('')" 2>/dev/null)
+if [[ -n "${CALLBACK_MSG_ID:-}" && -n "$PENDING_MSG_ID" && "$PENDING_MSG_ID" != "$CALLBACK_MSG_ID" ]]; then
+  expire_tapped_question
+fi
 QUESTION=$(printf '%s' "$PENDING_DATA" | python3 -c "
 import json, sys
 try:

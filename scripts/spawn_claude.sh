@@ -105,7 +105,9 @@ mkdir -p "$(dirname "$STREAM_LOG")"
 : > "$STREAM_LOG"
 
 USER_MSG="${1:-}"
-if [[ -z "$USER_MSG" ]]; then
+# An empty message is fine when the listener already seeded the inbox: a
+# compact-only spawn (🗜 in an idle chat) holds just the /compact line.
+if [[ -z "$USER_MSG" && "${CLAUDE_INBOX_PRESEEDED:-}" != "1" ]]; then
   echo "spawn_claude.sh: empty message" >&2
   exit 1
 fi
@@ -148,7 +150,7 @@ if [[ ! -d "$CWD" ]]; then
   echo "$(date -u +%FT%TZ) PERSISTENT active cwd gone: $CWD, resetting to default and re-queueing chat=$ROOM_CHAT_ID" >> "$LOG"
   DEFAULT_CWD="$(projects_dir)"
   python3 "$RS" set "$SESSIONS_FILE" --cwd "$DEFAULT_CWD" --session '' 2>>"$LOG" || true
-  printf '%s\n' "${USER_MSG//$'\n'/$'\x1e'}" >> "$ROOM_DIR/queue.jsonl"
+  [[ -n "$USER_MSG" ]] && printf '%s\n' "${USER_MSG//$'\n'/$'\x1e'}" >> "$ROOM_DIR/queue.jsonl"
   "$(notify_cmd)" --alert --tag "[${ROOM_LABEL:-room $ROOM_CHAT_ID}]" \
     "This room's working directory ($CWD) no longer exists, likely deleted during a task. Reset to $DEFAULT_CWD with a fresh session (the old one can't resume without its project folder); your message will retry automatically. Use the cwd menu button to pick another folder if needed." \
     >/dev/null 2>&1 || true
@@ -603,6 +605,13 @@ except Exception:
     skip = 0
 n = 0
 seen = 0
+# .pending_reacts is line-for-line parallel with the inbox; the requeued
+# message keeps its Telegram ids (after a \x1f, see listener.sh's
+# queue_line) so its reaction still resolves once it is answered.
+try:
+    reacts = [l for l in open(os.path.join(os.environ['ROOM_DIR_V'], '.pending_reacts')).read().splitlines() if l.strip()]
+except Exception:
+    reacts = []
 with open(os.environ['INBOX_F']) as f, open(os.environ['QUEUE_F'], 'a') as q:
     for line in f:
         line = line.strip()
@@ -611,6 +620,10 @@ with open(os.environ['INBOX_F']) as f, open(os.environ['QUEUE_F'], 'a') as q:
         seen += 1
         if seen <= skip:
             continue
+        try:
+            ids = [str(i) for i in json.loads(reacts[seen - 1]) if isinstance(i, int)]
+        except Exception:
+            ids = []
         try:
             content = json.loads(line)['message']['content']
         except Exception:
@@ -655,7 +668,7 @@ with open(os.environ['INBOX_F']) as f, open(os.environ['QUEUE_F'], 'a') as q:
             continue
         # Queue is line-oriented; \x1e escapes embedded newlines and
         # the listener's drain restores them.
-        q.write(content.replace('\n', '\x1e') + '\n')
+        q.write(content.replace('\n', '\x1e') + ('\x1f' + ' '.join(ids) if ids else '') + '\n')
         n += 1
 print(n)
 PYEOF
@@ -809,7 +822,7 @@ PYEOF
           # Tell the user via the alerts channel: a crash is otherwise
           # invisible (the room just goes quiet). Best-effort.
           "$(notify_cmd)" --alert --tag "[${ROOM_LABEL:-room $ROOM_CHAT_ID}]" \
-            "$BOT_NAME crashed (exit $EXIT). ${SALVAGED:-0} pending message(s) salvaged and will retry automatically with full context. Details: logs/spawn.log" >/dev/null 2>&1 || true
+            "$BOT_NAME stopped unexpectedly. ${SALVAGED:-0} unanswered message(s) will be retried automatically; the conversation is kept." >/dev/null 2>&1 || true
         fi
       fi
     fi
@@ -926,7 +939,7 @@ if [[ "$EXIT" -ne 0 ]]; then
     # mid-word (e.g. "Workflow" -> "Work flow"). Render it as a space here.
     _USER_MSG_CLEAN="${USER_MSG//$'\x1e'/ }"
     "$(notify_cmd)" --alert --tag "[${BOT_ROOM_LABEL:-room $ROOM_CHAT_ID}]" \
-      "Scheduled task failed (exit $EXIT): ${_USER_MSG_CLEAN:0:120}. Details: logs/spawn.log (alerts for this room muted for 1h)" >/dev/null 2>&1 || true
+      "A scheduled task didn't finish: ${_USER_MSG_CLEAN:0:120}. (Further failure alerts for this chat are muted for an hour.)" >/dev/null 2>&1 || true
     touch "$FAIL_NAG"
   fi
 fi

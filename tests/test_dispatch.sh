@@ -194,7 +194,7 @@ assert_contains "label acks rename"       "$OUT" "My Room"
 # ---- cancel ------------------------------------------------------------
 # cancel handler goes through reply_kb, so assert against tg_calls.log.
 run "cancel"
-assert_contains "cancel idle says nothing to cancel" "$(tg_calls)" "Nothing in flight to cancel"
+assert_contains "cancel idle says nothing to cancel" "$(tg_calls)" "Nothing running right now"
 
 # A live spawn with an inbox: cancel interrupts the turn (a stream-json
 # control request), it does not kill anything or clear the queue.
@@ -220,7 +220,7 @@ run "cancel"
 assert_contains "stuck interrupt force-stops" "$(tg_calls)" "force stopped"
 sleep 0.2
 assert_eq "force stop kills the spawn" "$(kill -0 "$FAKE_SPAWN" 2>/dev/null && echo alive || echo gone)" "gone"
-assert_eq "force stop requeues the unread message" "$(tail -1 "$ROOM/queue.jsonl")" "queued msg"
+assert_eq "force stop requeues the unread message, ids kept" "$(tail -1 "$ROOM/queue.jsonl")" "queued msg"$'\x1f'"42"
 assert_eq "force stop keeps what was queued" "$(head -1 "$ROOM/queue.jsonl")" "kept in queue"
 rm -f "$ROOM/queue.jsonl" "$ROOM/.inbox_ready"
 
@@ -280,14 +280,41 @@ runCB "close_delete" "99005"
 assert_contains     "act:close_delete deletes the tapped message"       "$(tg_calls)" "delete 99005"
 assert_not_contains "act:close_delete does not collapse (no editkb/kb)" "$(tg_calls)" "editkb"
 
+# ---- ask_user answers -----------------------------------------------------
+# A tap on a question nobody is waiting for says it expired (it used to do
+# nothing visible), and a tap on an OLDER question never answers the newer
+# one that is pending.
+rm -f "$ROOM/.ask_user_pending.json" "$ROOM/.ask_user_answer"
+runCB "ask_answer __idx__0" 501
+assert_contains "tap with nothing pending says expired" "$(tg_calls)" "expired"
+printf '%s' '{"prompt":"Ship it?","options":["Yes","No"],"msg_id":600}' > "$ROOM/.ask_user_pending.json"
+runCB "ask_answer __idx__0" 501
+assert_contains "tap on an older question says expired" "$(tg_calls)" "expired"
+assert_no_file  "older tap does not answer the pending question" "$ROOM/.ask_user_answer"
+runCB "ask_answer __idx__1" 600
+assert_file_eq  "tap on the pending question answers it" "$ROOM/.ask_user_answer" "No"
+rm -f "$ROOM/.ask_user_pending.json" "$ROOM/.ask_user_answer"
+
 # ---- new lifecycle ------------------------------------------------------
 run "new"
 assert_contains "new no-session message"  "$OUT" "Nothing to reset"
 
 python3 "$RS" set "$ROOM/sessions.json" --cwd /Users/x/projects/q --session SID-LIVE
 run "new"
-assert_contains "new resets session"      "$OUT" "New session started"
+assert_contains "new resets session"      "$(tg_calls)" "New session started"
+assert_contains "new offers an undo"      "$(tg_calls)" "act:new undo"
 assert_eq       "new drops session"       "$(python3 "$RS" get-session "$ROOM/sessions.json")" ""
+run "new undo"
+assert_contains "undo restores the conversation" "$(tg_calls)" "Previous conversation restored"
+assert_eq       "undo puts the old session back" "$(python3 "$RS" get-session "$ROOM/sessions.json")" "SID-LIVE"
+run "new undo"
+assert_contains "a second undo has nothing to do" "$(tg_calls)" "Nothing to undo"
+run "new"
+python3 "$RS" set "$ROOM/sessions.json" --cwd /Users/x/projects/elsewhere
+run "new undo"
+assert_contains "undo refuses after a folder switch" "$(tg_calls)" "switched folders"
+python3 "$RS" set "$ROOM/sessions.json" --cwd /Users/x/projects/q
+rm -f "$ROOM/.prev_session"
 
 # ---- cd resolution + session-drop semantics -----------------------------
 mkdir -p "$HOME_TESTDIR"
@@ -304,6 +331,26 @@ assert_contains "cd same dir is a no-op"  "$OUT" "Already in"
 run "cd /etc"
 assert_contains "cd outside HOME refused" "$OUT" "Refused"
 assert_eq       "refused cd keeps cwd"    "$(python3 "$RS" get-cwd "$ROOM/sessions.json")" "$EXPECT_CWD"
+
+# Switching folders while a reply is running asks first; the confirm
+# button ("--now") switches and stops it. spawn_state is stubbed to report
+# a reply in progress (the fake spawn has no transcript to classify).
+mkdir -p "$HOME_TESTDIR/other"
+python3 "$RS" set "$ROOM/sessions.json" --cwd "$EXPECT_CWD" --session MIDSID
+mv "$TMP/scripts/spawn_state.py" "$TMP/scripts/spawn_state.py.real"
+printf '%s\n' 'import json; print(json.dumps({"state": "tool"}))' > "$TMP/scripts/spawn_state.py"
+sleep 100 & SPAWN_PID=$!
+echo "$SPAWN_PID" > "$ROOM/busy.lock"
+run "cd $HOME_TESTDIR/other"
+assert_contains "cd mid-reply asks first"          "$(tg_calls)" "A reply is still running"
+assert_contains "cd confirm button switches now"   "$(tg_calls)" "act:cd --now $HOME_TESTDIR/other"
+assert_eq       "cd mid-reply keeps the session"   "$(python3 "$RS" get-session "$ROOM/sessions.json")" "MIDSID"
+assert_eq       "cd mid-reply leaves the reply running" "$(kill -0 "$SPAWN_PID" 2>/dev/null && echo alive)" "alive"
+run "cd --now $HOME_TESTDIR/other"
+assert_contains "cd --now switches"                "$OUT" "other"
+assert_eq       "cd --now drops the session"       "$(python3 "$RS" get-session "$ROOM/sessions.json")" ""
+kill -9 "$SPAWN_PID" 2>/dev/null; rm -f "$ROOM/busy.lock"
+mv "$TMP/scripts/spawn_state.py.real" "$TMP/scripts/spawn_state.py"
 
 # ---- restart: neutralised execute ----------------------
 # BOT_RESTART_CMD is forced to a no-op (`true`) and BOT_RESTART_DELAY=0 so the

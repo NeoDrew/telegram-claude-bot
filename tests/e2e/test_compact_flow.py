@@ -14,8 +14,11 @@ plus a real regression found while extending this coverage.
      window): touches .compact_pending instead and acks "🗜 Queued context
      compression."
 
-  3. Pending while idle: also touches .compact_pending, acks "🗜 Context
-     compression queued for next session.", and is injected BEFORE the next
+  3. Idle: acks "🗜 Compressing context now." and the listener's next drain
+     pass starts Claude just to compress (no message needed), so the next
+     message does not wait through it. That message is then answered as an
+     ordinary turn. (This used to wait for the next message and inject
+     /compact BEFORE the next
      real user message once one arrives (start_spawn's pre-seed step), as a full
      round trip, confirming both the injected /compact turn and the real
      message get answered.
@@ -52,6 +55,7 @@ unrelated turn can't fire a false "Context compressed."
 Run: python3 tests/e2e/test_compact_flow.py
 """
 
+import json
 import os
 import signal
 import subprocess
@@ -240,8 +244,12 @@ def case_pending_when_idle_resolves_on_next_spawn():
                 extra_env={"BOT_DRAFT_STREAMING": "0"})
         h.start_listener()
 
-        # Room genuinely idle: no message has ever been sent, no spawn has
-        # ever run, so there's no busy.lock and no live inbox at all.
+        # An earlier conversation to compress (with none, the tap has
+        # nothing to do and is dropped).
+        h.seed_room_file(DM_CHAT_ID, "sessions.json", json.dumps(
+            {"active_cwd": h.sandbox, "session_id": "11111111-2222-3333-4444-555555555555"}))
+        # Room genuinely idle: no spawn is running, so there's no busy.lock
+        # and no live inbox at all.
         busy_lock = os.path.join(h.room_dir(DM_CHAT_ID), "busy.lock")
         assert not os.path.exists(busy_lock), (
             "test setup bug: room should be idle with no prior spawn")
@@ -249,27 +257,22 @@ def case_pending_when_idle_resolves_on_next_spawn():
         h.inject_callback_query("act:compact", chat_id=DM_CHAT_ID)
         h.wait_for_call(
             "editMessageText",
-            lambda p: "Context compression queued for next session"
-            in p.get("text", ""),
+            lambda p: "Compressing context now" in p.get("text", ""),
             timeout=15)
-        print("ok: correct ack for idle room ('...queued for next session.')")
+        print("ok: correct ack for idle room ('Compressing context now.')")
 
-        pending_path = os.path.join(h.room_dir(DM_CHAT_ID), ".compact_pending")
-        assert os.path.exists(pending_path), (
-            "expected .compact_pending touched for the idle path")
-        print("ok: .compact_pending marker set")
-
-        # A real message now starts the first-ever spawn for this room.
-        # start_spawn's pre-seed step must inject /compact BEFORE this
-        # message, not coalesce it into the message text.
-        h.inject_dm("what's the weather like", message_id=1)
-
+        # No message sent: the compaction runs on its own.
         h.wait_for_call(
             "sendMessage",
             lambda p: "Context compressed" in p.get("text", ""),
             timeout=20)
-        print("ok: 'Context compressed.' confirmation fired from the "
-              "pre-seeded /compact turn")
+        print("ok: compressed straight away, without waiting for a message")
+        pending_path = os.path.join(h.room_dir(DM_CHAT_ID), ".compact_pending")
+        inbox = h.read_room_file(DM_CHAT_ID, "inbox.ndjson", default="")
+        assert inbox.count("/compact") == 1 and inbox.count("\n") == 1, (
+            f"the compact-only spawn should hold just the /compact line: {inbox!r}")
+
+        h.inject_dm("what's the weather like", message_id=1)
 
         assert not os.path.exists(pending_path), (
             ".compact_pending left dangling; would misfire on a LATER, "
@@ -345,7 +348,7 @@ def case_compact_salvaged_after_crash_stays_separate_from_real_message():
         # crash path actually fired (proves the reproduction is real, not
         # accidentally skipped).
         h.wait_for_call(
-            "sendMessage", lambda p: "crashed" in p.get("text", "").lower(),
+            "sendMessage", lambda p: "stopped unexpectedly" in p.get("text", "").lower(),
             timeout=20)
         print("ok: spawn crashed while /compact was still unconsumed "
               "(the regression scenario)")

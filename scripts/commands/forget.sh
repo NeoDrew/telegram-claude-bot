@@ -39,7 +39,7 @@
     fi
 
     if [[ -z "$TARGET" ]]; then
-      echo "Usage: /forget <chat_id>"
+      echo "Pick the chat to forget from 🌐 rooms in ⚙️ more options."
       exit 0
     fi
     if [[ "$TARGET" == "$ROOM_CHAT_ID" ]]; then

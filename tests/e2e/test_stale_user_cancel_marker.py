@@ -114,7 +114,7 @@ def case_stale_marker_does_not_hijack_later_crash():
         # the real crash alert is the direct assertion that the stale
         # marker was correctly ignored.
         crash_alert = h.wait_for_call(
-            "sendMessage", lambda p: "crashed" in p.get("text", "").lower(),
+            "sendMessage", lambda p: "stopped unexpectedly" in p.get("text", "").lower(),
             timeout=20)
         print(f"ok: crash was correctly detected despite the stale marker: "
               f"{crash_alert['params'].get('text', '')!r}")

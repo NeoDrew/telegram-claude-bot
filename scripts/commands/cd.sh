@@ -64,6 +64,24 @@ PYEOF
       reply_kb "$HEAD" "$KB"
       exit 0
     fi
+    # Switching folders mid-reply stops that reply, so ask first. BUG
+    # FIXED: the tap used to cut the reply off with no warning. "--now"
+    # (the confirm button) skips the question.
+    if [[ "$ARGS" == "--now "* ]]; then
+      ARGS="${ARGS#--now }"
+    elif is_busy "$ROOM_CHAT_ID"; then
+      CD_STATE=$(python3 "$REPO_ROOT/scripts/spawn_state.py" "$ROOM_DIR" 2>/dev/null \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state",""))' 2>/dev/null)
+      CD_CB="act:cd --now $ARGS"
+      # Telegram caps callback_data at 64 bytes; a longer path just switches.
+      if [[ "$CD_STATE" =~ ^(streaming|tool|awaiting_result|compacting)$ && ${#CD_CB} -le 64 ]]; then
+        CD_KB=$(CD_CB="$CD_CB" python3 -c 'import json,os
+print(json.dumps([[{"text": "Switch and stop it", "callback_data": os.environ["CD_CB"]},
+                   {"text": "Keep going", "callback_data": "act:noop"}]]))')
+        reply_kb "A reply is still running here. Switching to \`$ARGS\` stops it and starts a fresh session." "$CD_KB" 0
+        exit 0
+      fi
+    fi
     # Resolve the target directory, update sessions.json, and print the
     # user-visible reply. If the cwd actually changed, the block appends
     # a "__CD_DROPPED_SESSION__" sentinel line so the surrounding shell

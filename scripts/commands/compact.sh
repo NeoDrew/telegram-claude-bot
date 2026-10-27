@@ -15,7 +15,8 @@
       touch "$ROOM_DIR/.compact_pending"
       echo "🗜 Queued context compression."
     else
-      # Room is idle. Mark it; the next spawn will inject /compact first.
+      # Room is idle. The listener's next drain pass starts Claude just to
+      # compress (drain_queue_if_idle), so it is done before you need it.
       touch "$ROOM_DIR/.compact_pending"
-      echo "🗜 Context compression queued for next session."
+      echo "🗜 Compressing context now."
     fi

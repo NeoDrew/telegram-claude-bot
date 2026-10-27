@@ -484,7 +484,8 @@ def _fmt_error_result(raw_err: str) -> str:
     low = raw_err.lower()
     is_rate = any(kw in low for kw in _RATE_LIMIT_KEYWORDS)
     if not is_rate:
-        return f"⚠️ claude error: {raw_err}"
+        return (f"⚠️ Claude hit an error: {raw_err}\n"
+                "Your last message wasn't answered; send it again to retry.")
 
     try:
         cache = json.loads(USAGE_CACHE.read_text()) if USAGE_CACHE.exists() else {}
@@ -1714,6 +1715,47 @@ def _record_ctx(ev: dict):
         pass
 
 
+def _compact_threshold() -> int:
+    """The room's auto compact setting, else BOT_PRECOMPACT_PCT (90)."""
+    try:
+        v = int(_room_path("autocompact").read_text().strip())
+        if 40 <= v <= 90:
+            return v
+    except Exception:
+        pass
+    try:
+        return int(bot_config.get("BOT_PRECOMPACT_PCT", "90") or 90)
+    except ValueError:
+        return 90
+
+
+def _compact_now_if_full(ev: dict):
+    """A reply that ends with the context at or past the threshold queues a
+    /compact straight away, so it runs while the user reads the answer
+    instead of in front of their next message. Only when nothing unread is
+    waiting (that message would otherwise be answered first, at the full
+    context; listener.sh's context_full and the prompt-too-long recovery
+    cover it)."""
+    global _ptl_compact_queued
+    if ev.get("is_error") or _ptl_compact_queued:
+        return
+    pct = ctx_pct_from_result(ev)
+    if pct is None or pct < _compact_threshold():
+        return
+    if _inbox_cursor < len(_inbox_entries()):
+        return
+    try:
+        _append_inbox("/compact", [])
+        _ptl_compact_queued = True
+        _room_path(".ctx_pct").unlink(missing_ok=True)
+        # Marks the next result as the compaction: no "Worked for" footer,
+        # the progress bubble is the confirmation.
+        _room_path(".compact_in_flight").touch()
+        log(f"context at {pct:.0f}%, compacting now")
+    except Exception as e:
+        log(f"auto compact failed: {e}")
+
+
 def _compacting_marker(on: bool):
     try:
         p = _room_path(".compacting")
@@ -2836,6 +2878,10 @@ def main():
                         if tg_send(footer_text, keyboard=footer_kb) is None:
                             _wait_for_cooldown("turn-end footer retry")
                             tg_send(footer_text, keyboard=footer_kb)
+
+                # Last, after this reply's footer: it marks the NEXT result
+                # as the compaction.
+                _compact_now_if_full(ev)
 
             elif evtype == "rate_limit_event":
                 # Cache the latest snapshot per limit type. /usage reads this

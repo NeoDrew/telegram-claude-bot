@@ -27,7 +27,7 @@
 
     if ! is_busy "$ROOM_CHAT_ID"; then
       rm -f "$BUSY_LOCK"
-      reply_kb "Nothing in flight to cancel." "[]"
+      reply_kb "Nothing running right now." "[]"
     elif [[ -f "$ROOM_DIR/.inbox_ready" && "$irq_stuck" == "0" && "${ARGS:-}" != "force" ]]; then
       cancel_state=$(python3 "$REPO_ROOT/scripts/spawn_state.py" "$ROOM_DIR" 2>/dev/null \
         | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state",""))' 2>/dev/null)
@@ -48,7 +48,7 @@
       # Force stop. Keep every user line Claude had not read yet. The
       # first unanswered line is the turn being cancelled even when its
       # read echo has not been recorded yet.
-      INBOX_F="$ROOM_DIR/inbox.ndjson" READ_F="$ROOM_DIR/.inbox_read" DONE_F="$ROOM_DIR/.turns_done" QUEUE_F="$QUEUE_FILE" python3 - <<'PYEOF' 2>/dev/null
+      INBOX_F="$ROOM_DIR/inbox.ndjson" READ_F="$ROOM_DIR/.inbox_read" DONE_F="$ROOM_DIR/.turns_done" QUEUE_F="$QUEUE_FILE" REACTS_F="$ROOM_DIR/.pending_reacts" python3 - <<'PYEOF' 2>/dev/null
 import json, os
 def num(path):
     try:
@@ -60,15 +60,24 @@ try:
     lines = [l for l in open(os.environ["INBOX_F"]).read().splitlines() if l.strip()]
 except Exception:
     lines = []
+try:
+    reacts = [l for l in open(os.environ["REACTS_F"]).read().splitlines() if l.strip()]
+except Exception:
+    reacts = []
 with open(os.environ["QUEUE_F"], "a") as q:
-    for line in lines[read:]:
+    for i, line in enumerate(lines[read:], start=read):
         try:
             obj = json.loads(line)
         except Exception:
             continue
         c = (obj.get("message") or {}).get("content") if obj.get("type") == "user" else None
         if isinstance(c, str) and c.strip() and c.strip() != "/compact":
-            q.write(c.strip().replace("\n", "\x1e") + "\n")
+            try:
+                ids = [str(x) for x in json.loads(reacts[i]) if isinstance(x, int)]
+            except Exception:
+                ids = []
+            # Ids ride after \x1f (listener.sh queue_line) so the reaction resolves.
+            q.write(c.strip().replace("\n", "\x1e") + ("\x1f" + " ".join(ids) if ids else "") + "\n")
 PYEOF
       kill_room_spawn "$ROOM_DIR" 1
       rm -f "$IRQ" "$ROOM_DIR/.inbox_read"

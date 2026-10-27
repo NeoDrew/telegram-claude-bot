@@ -185,7 +185,7 @@ def main():
     texts = sent_texts(calls)
     check(any("Context is full" in t for t in texts), "too long: tells the user it is compressing")
     check(any("fit in the context" in t for t in texts), "too long twice: gives up with an explanation")
-    check(not any("claude error" in t for t in texts),
+    check(not any("claude error" in t or "hit an error" in t for t in texts),
           "too long: never 'claude error: success'", f"got {texts}")
 
     # 4. Interrupt.
@@ -199,12 +199,34 @@ def main():
     calls, room = run(inbox, [[7], [], [8]], events, markers=(".interrupt_requested",))
     texts = sent_texts(calls)
     check(any("Interrupted" in t for t in texts), "interrupt: says Interrupted")
-    check(not any("claude error" in t for t in texts), "interrupt: no error message", f"got {texts}")
+    check(not any("claude error" in t or "hit an error" in t for t in texts), "interrupt: no error message", f"got {texts}")
     check(not (room / ".interrupt_requested").exists(), "interrupt: marker cleared")
     got = [r for r in reactions(calls) if r[1] == "👍"]
     check(got == [(7, "👍"), (8, "👍")], "interrupt: both messages end on 👍", f"got {got}")
     check((room / ".turns_done").read_text().strip() == "3",
           "interrupt: .turns_done steps over the control line")
+
+    # 5. A reply that ends with the context past the threshold queues a
+    #    /compact at once (nothing unread), not in front of the next message.
+    def full_result(pct):
+        r = result()
+        r["modelUsage"] = {"m": {"contextWindow": 200000}}
+        r["usage"] = {"iterations": [{"input_tokens": int(pct * 2000),
+                                       "cache_read_input_tokens": 0,
+                                       "cache_creation_input_tokens": 0}]}
+        return r
+    calls, room = run([user_line("hi")], [[9]], [*text_turn("done"), full_result(95)])
+    lines = [json.loads(l)["message"]["content"] for l in (room / "inbox.ndjson").read_text().splitlines()]
+    check(lines == ["hi", "/compact"], "full context: /compact queued right after the reply", f"got {lines}")
+    check(any("Worked for" in t for t in sent_texts(calls)), "full context: the reply still gets its footer")
+    check((room / ".compact_in_flight").exists(), "full context: the compaction is marked so it has no footer")
+    calls, room = run([user_line("hi")], [[9]], [*text_turn("done"), full_result(60)])
+    lines = [json.loads(l)["message"]["content"] for l in (room / "inbox.ndjson").read_text().splitlines()]
+    check(lines == ["hi"], "roomy context: nothing queued", f"got {lines}")
+    calls, room = run([user_line("hi"), user_line("waiting")], [[9], [10]],
+                      [*text_turn("done"), full_result(95)])
+    lines = [json.loads(l)["message"]["content"] for l in (room / "inbox.ndjson").read_text().splitlines()]
+    check("/compact" not in lines, "full context with a message waiting: not queued behind it", f"got {lines}")
 
     if failures:
         print("\nFAILED:")
