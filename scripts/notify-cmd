@@ -1,0 +1,91 @@
+#!/bin/bash
+# notify-cmd: push a message or photo to the user via the COMMAND bot
+# (telegram-claude-bot). Routes through tg.sh.
+#
+# This is the bot's only phone notifier. Link it onto your PATH so any
+# session or cron job can use it: scripts/install.sh does this.
+#
+# Routing logic (evaluated in this order):
+#   --dm       force the owner DM regardless of everything else
+#   --alert    route to the alerts channel (same as the default when CHAT_ID
+#              is unset, but kept as an explicit flag for clarity)
+#   CHAT_ID    set by bot spawns to their own room; honours it when present
+#   (default)  alerts channel, so terminal/cron sessions never flood the DM
+#
+# The DM is "this channel" where the owner talks to the assistant; alerts belong in the
+# dedicated alerts group, not interleaved with that conversation.
+#
+# --dm forces the owner DM explicitly (use for personal one-off messages,
+# not for automated alerts).
+#
+# Usage:
+#   notify-cmd "message"
+#   notify-cmd --tag "[label]" "message"
+#   notify-cmd --alert --tag "[room]" "urgent: needs your sign-off"
+#   notify-cmd --dm "message"
+#   echo "message" | notify-cmd
+#   notify-cmd --photo /abs/path.png
+#   notify-cmd --photo /abs/path.png --caption "what this shows"
+#   notify-cmd --file /abs/path.zip
+#   notify-cmd --file /abs/path.pdf --caption "final report"
+
+set -uo pipefail
+# Works from the repo or through a symlink (e.g. ~/.local/bin/notify-cmd ->
+# <repo>/scripts/notify-cmd): paths are resolved from this file's real location.
+REPO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+TG="$REPO_ROOT/scripts/tg.sh"
+ALERTS_FILE="$REPO_ROOT/state/.alerts_chat_id"
+
+TAG=""
+PHOTO=""
+FILE=""
+CAPTION=""
+_EXPLICIT_DM=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --alert)   CHAT_ID="$(tr -d ' \n\r' < "$ALERTS_FILE" 2>/dev/null || true)"
+               export CHAT_ID; shift ;;
+    --dm)      _EXPLICIT_DM=1; shift ;;
+    --tag)     TAG="$2 "; shift 2 ;;
+    --photo)   PHOTO="$2"; shift 2 ;;
+    --file)    FILE="$2"; shift 2 ;;
+    --caption) CAPTION="$2"; shift 2 ;;
+    *) break ;;
+  esac
+done
+
+if [[ "$_EXPLICIT_DM" == "1" ]]; then
+  # Explicit --dm: clear CHAT_ID so tg.sh falls back to owner DM.
+  unset CHAT_ID
+elif [[ -z "${CHAT_ID:-}" ]]; then
+  # No bot-spawn CHAT_ID and no --alert already set: default to the alerts
+  # channel so terminal/cron sessions never land in the DM conversation.
+  CHAT_ID="$(tr -d ' \n\r' < "$ALERTS_FILE" 2>/dev/null || true)"
+  export CHAT_ID
+fi
+
+if [[ -n "$PHOTO" ]]; then
+  if [[ ! -f "$PHOTO" ]]; then
+    echo "notify-cmd: photo not found: $PHOTO" >&2
+    exit 1
+  fi
+  exec "$TG" photo "$PHOTO" "${TAG}${CAPTION}"
+fi
+
+if [[ -n "$FILE" ]]; then
+  if [[ ! -f "$FILE" ]]; then
+    echo "notify-cmd: file not found: $FILE" >&2
+    exit 1
+  fi
+  exec "$TG" document "$FILE" "${TAG}${CAPTION}"
+fi
+
+MSG="$*"
+if [[ -z "$MSG" ]]; then
+  MSG=$(cat)
+fi
+if [[ -z "$MSG" ]]; then
+  echo "notify-cmd: empty message" >&2
+  exit 1
+fi
+exec "$TG" send "${TAG}${MSG}"

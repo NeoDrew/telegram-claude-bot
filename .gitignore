@@ -1,0 +1,15 @@
+.env
+state/
+logs/
+*.log
+__pycache__/
+*.pyc
+.venv/
+.gstack/
+
+# Local-only files: kept on disk, never published.
+scheduled/
+# Local Claude Code hooks (none are tracked; use git add -f to publish one).
+hooks/*
+.primary_host
+.claude/settings.json

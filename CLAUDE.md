@@ -1,0 +1,471 @@
+# CLAUDE.md: telegram-claude-bot
+
+Central Telegram bot that fronts a long-lived Claude Code conversation. Talks to `@your_claude_bot`. Lets the user message claude from their phone, switch projects, stream replies word-by-word, send screenshots, and reset on demand.
+
+## What lives where
+
+```
+scripts/
+├── listener.sh             ← long-poll daemon, dispatches each Telegram update
+├── lib.sh                  ← shared bash helpers (extract_var, kill_tree, kill_room_spawn,
+│                              reply_kb, is_busy); sourced by listener.sh, handle_action.sh,
+│                              spawn_claude.sh, and tg.sh.
+├── handle_action.sh        ← ACTION DISPATCHER. Called as `handle_action.sh <cmd> [args...]`
+│                              (no slashes; the wire format is "act:<cmd>" on the callback
+│                              side and pure verbs internally). A case statement routes each
+│                              verb to scripts/commands/<verb>.sh.
+├── commands/               ← one file per action (sourced by handle_action.sh, so they run
+│   ├── status.sh              in its shell: REPO_ROOT, ROOM_DIR, SESSIONS_FILE, CMD, ARGS,
+│   ├── cd.sh                  CALLBACK_MSG_ID and lib.sh helpers are all in scope). Each
+│   ├── windows.sh             handler either writes a reply to stdout (the listener wraps it
+│   └── … (29 total)           with a back-to-menu row) or draws its own keyboard via reply_kb.
+├── render_rooms.py         ← shared rooms dashboard (text + 🗑 forget buttons),
+│                              used by both /rooms and the /forget flow so they
+│                              render identically. Live group titles via getChat.
+├── room_state.py           ← SINGLE SOURCE OF TRUTH for a room's sessions.json
+│                              ({active_cwd, session_id}). CLI (get-cwd/get-session/set/
+│                              clear-session/init) for bash callers, importable module for
+│                              python callers. Owns the flat-shape + legacy-map fallback.
+├── spawn_state.py          ← classifies what a spawn is doing NOW (idle/streaming/tool/…),
+│                              read by /status + /rooms. NOT a sessions.json accessor.
+├── spawn_claude.sh         ← invokes claude with session continuity + streaming
+├── stream_to_telegram.py   ← parses claude's stream-json NDJSON → editMessageText
+├── md_telegram.py          ← markdown → Telegram HTML converter (shared by streamer + tg.sh)
+├── enum_windows.py         ← lists visible macOS user windows (PyObjC/Quartz), used by /tab
+├── capture_window.py       ← Quartz CGWindowListCreateImage capture, used by /tab
+├── tg.sh                   ← sendMessage / editMessageText / sendPhoto / sendMediaGroup wrappers
+├── notify-cmd              ← the phone notifier (install.sh links it to ~/.local/bin)
+├── bot_config.py           ← Python side of the machine-specific settings (see below)
+└── install.sh              ← writes the launchd plist + loads it, builds .venv,
+                               links notify-cmd
+
+tests/                      ← offline test suite (no network, no real state)
+├── run.sh                  ← runs everything; exit 0 iff all pass (`bash tests/run.sh`)
+├── test_room_state.py      ← exhaustive room_state.py (schema, legacy, byte-identity)
+├── test_md_telegram.py     ← markdown→HTML converter incl. HTML-escaping safety
+├── test_lib.sh             ← extract_var / reply_kb / kill_tree
+├── test_dispatch.sh        ← dispatcher routing + handlers in a stubbed fake repo
+├── lib_assert.sh           ← shared bash assert helpers
+├── test_streamer_smoke.py  ← streamer regression test (streaming + tool-ping suppression)
+├── test_group_thinking_teardown.py ← group-chat "💭 Thinking…" placeholder teardown
+├── test_group_silent_drop.py ← group-chat reply silently dropped after a tool call
+├── …                       ← one test_*.py / test_*.sh per behaviour (run.sh lists them all)
+└── e2e/                    ← full E2E suite: the REAL listener.sh/spawn_claude.sh/
+                               stream_to_telegram.py run as real subprocesses against
+                               fakes/fake_telegram_server.py + fakes/fake_claude.py
+                               instead of the real Telegram/Claude backends. Separate
+                               from the fast suite above (seconds per scenario, not
+                               ms). `bash tests/e2e/run.sh`. See tests/e2e/README.md.
+
+.venv/                      ← gitignored. Houses PyObjC for enum_windows.py.
+                              Created by install.sh with `BOT_PYTHON` (default: first python3 on PATH) `-m venv .venv`
+                              and `pip install pyobjc-framework-Quartz`.
+
+state/rooms/<chat_id>/      ← per-room state (see "Multi-chat / rooms" below)
+state/offset                ← bot-global Telegram getUpdates cursor
+
+logs/                       ← gitignored
+├── listener.log
+├── spawn.log
+├── stream.log              ← only created if streaming hits an error
+├── windows.log            ← /windows lifecycle: enumerate/capture/send + summary
+├── launchd.out / launchd.err
+```
+
+## Architecture
+
+```
+phone → Telegram cloud
+            ↕ long-poll (getUpdates, ?timeout=30)
+   listener.sh (launchd KeepAlive, ~/Library/LaunchAgents/<BOT_LAUNCHD_LABEL>.plist)
+      │
+      ├─ callback_query (button tap)
+      │     ├─ "decor:*"      → silent ack; inert button
+      │     └─ "act:<cmd>..." → handle_action.sh <cmd> <args> → reply edited in place
+      ├─ typed /menu | /start → handle_action.sh menu (this bot's only two typeable commands)
+      └─ typed text (any other slash, or none) → same plain-text path below (Claude sees the
+                                                   literal text, including its own leading "/")
+            │
+            ├─ if busy + .inbox_ready  → inject NDJSON line into inbox.ndjson
+            │                            (lands at the next inter-turn boundary)
+            ├─ if busy, NOT ready      → append to queue.jsonl (spawn warming
+            │                            down or a silent one-shot in flight);
+            │                            drain spawns it when the room frees up
+            └─ if idle     → listener truncates+seeds inbox, touches
+                              .inbox_ready, THEN backgrounds spawn_claude.sh
+                              │  (listener-side seeding: no warmup window in
+                              │   which an injected follow-up could be lost)
+                              │  writes busy.lock with pid
+                              │  cd to state.active_cwd
+                              │  claude --resume <uuid> -p ...
+                              │      --output-format=stream-json --include-partial-messages
+                              │  pipe stdout → stream_to_telegram.py
+                              │      ├─ first event → sendMessage "…", remember message_id
+                              │      ├─ text_delta  → buffer; editMessageText every ≥600 ms
+                              │      ├─ thinking_delta with text → rendered like text_delta
+                              │      ├─ tool_use → live text committed, then a tool-marker
+                              │      │     message at content_block_stop (verbosity-gated)
+                              │      ├─ buffer >3800 → finalize, sendMessage carry-over
+                              │      └─ message_stop → final edit
+                              └─ on completion, busy.lock removed implicitly via pid death
+```
+
+After each polling round, `drain_queue_if_idle` coalesces everything in `queue.jsonl` and spawns it if no spawn is in flight. The queue is the OVERFLOW path: it receives messages that arrive while a room is busy without a live inbox consumer (`.inbox_ready` absent: spawn teardown window, or a silent one-shot in flight) plus messages salvaged from the inbox when a spawn crashes. `.inbox_ready` is created by the listener at seed time (or by a self-seeding manual spawn), removed by the spawn the moment its pipeline ends (and first thing in its TERM/INT cleanup), and by `kill_room_spawn`. On a crash exit, `spawn_claude.sh` extracts every user message still in the inbox back into `queue.jsonl` and pushes a `notify-cmd --alert`; the circuit breaker truncates BOTH inbox and queue when it trips, because tripping means "stop retrying".
+
+## State file shapes
+
+`sessions.json` (flat shape, one session per room):
+```json
+{
+  "active_cwd": "~/projects/myapp",
+  "session_id": "abc-123-…"
+}
+```
+
+A room holds **at most one** session at a time. `/cd <newdir>` drops `session_id` and switches `active_cwd`; the next message mints a fresh UUID. `/cd <same dir>` is a no-op. If you want to keep a conversation alive across project switches, make a new Telegram group chat with the bot instead; that's the "more storage" UX, not per-cwd resume.
+
+Back-compat: the old shape `{active_cwd, sessions: {cwd: uuid}}` is still readable; all readers fall back to `sessions[active_cwd]` when `session_id` is absent. The next write normalises the file to the flat shape and drops the legacy map.
+
+`busy.lock`: a single line containing the pid of the background `spawn_claude.sh`. `is_busy()` checks `kill -0 $pid` and clears the lock if the pid is gone. `handle_cancel_inline()` does `pkill -P $pid` then `kill $pid` (TERM → KILL) and clears the lock + queue.
+
+`effort`: a single line with the claude effort level, written by `/effort` and read by `spawn_claude.sh` on each spawn. The real `--effort` levels are `low`/`medium`/`high`/`xhigh`/`max`; absent → no `--effort` flag (claude's default). The bare-`/effort` keyboard gates which levels it offers to the room's current model (Haiku has none; Sonnet 4.6 / Opus 4.6 stop at `max`; Opus 4.7 adds `xhigh`; Opus 4.8 / Fable 5 add `ultracode`). **`ultracode` is NOT an `--effort` value**: `claude --effort ultracode` warns and is ignored. It is a Claude Code session setting (sends `xhigh` and has claude auto-orchestrate dynamic workflows); `spawn_claude.sh` translates a stored `ultracode` into `--settings '{"ultracode":true}'` (which merges into, not replaces, the settings hierarchy) and passes no `--effort` flag.
+
+`model`: a single line with the claude model id, written by `/model`/`/tune` and read by `spawn_claude.sh` on each spawn (`scripts/model_effort.py`'s `OPTIONS`/`DEFAULT_MODEL` is the single source of truth for the catalogue, imported by `effort.sh`/`model.sh`/`tune.sh`). Absent or empty → `spawn_claude.sh` explicitly passes `--model <DEFAULT_MODEL>` (`DEFAULT_MODEL` itself can be overridden with the `BOT_DEFAULT_MODEL` setting). Previously an absent `model` file meant `spawn_claude.sh` omitted `--model` entirely and fell through to claude's own ambient default, which could drift out of sync with what the `/model`/`/tune` menus *displayed* as "default" (that label reads `DEFAULT_MODEL`, but nothing enforced it). Now the label and the actual spawned model are the same value by construction. The bare "opus" typed alias (not on any button) tracks `DEFAULT_MODEL` dynamically; "opus48" is a fixed synonym for the specific opus-4-8 id regardless of what the current default is.
+
+## Multi-chat / rooms
+
+The bot supports any number of independent Telegram chats (DM, groups, forum topics). Each chat is a **room** keyed by `chat_id`, with its own state at `state/rooms/<chat_id>/`:
+
+```
+state/
+├── offset                        ← bot-global Telegram getUpdates cursor
+├── scheduled.json                ← GLOBAL scheduled tasks (one file, all rooms).
+│                                    Each entry carries an explicit
+│                                    target_chat_id; the listener routes
+│                                    fires by that field.
+├── room_registry.json            ← project path/URL prefix → required
+│                                    target_chat_id. schedule_task.sh
+│                                    REFUSES misrouted writes.
+└── rooms/
+    └── <chat_id>/
+        ├── sessions.json         ← {active_cwd, sessions: {cwd → uuid}}
+        ├── busy.lock             ← present when a spawn is running for THIS room
+        ├── queue.jsonl           ← per-room queued messages
+        └── effort                ← per-room /effort level
+```
+
+`listener.sh`'s parser captures `(update_id, chat_id, from_user_id, text)` per update. The **allowlist** is on `from_user_id`, not `chat_id`; the **room** is `chat_id`. A sender is allowed if any of: (1) they are the owner (`from_user_id == TELEGRAM_CHAT_ID` from `.env`), (2) their id is in the optional static `TELEGRAM_ALLOWED_IDS` (comma/space separated, also global), or (3) they are approved for THIS specific room via the Users menu (`state/approved_users.json`). Cases 1 and 2 are trusted in every room and frozen at boot; case 3 is per-room and read live. So the owner can talk to the bot from any chat they're in, and approved users can talk only in the rooms they were approved for; each chat is its own conversation.
+
+### Approving extra users (per-room)
+
+The owner can let other Telegram users talk to the bot in a specific room, without sharing the `.env` or hand-editing anything. The flow is menu-driven and keyed on the immutable numeric `from.id` (never the mutable @username). **👥 users** opens a two-section management screen and the buttons move people between the sections:
+
+- **✅ Members**: approved, can talk to the bot in this room. Each has a 🗑 that revokes them (and demotes them to Pending so they're one tap to re-add).
+- **⏳ Pending**: users who messaged this room but aren't approved. The listener's drop path captures them (see below). Each has a ✅ that approves them (promotes to Members).
+
+Mechanics:
+
+- **Capture:** when the gate drops a non-allowlisted sender (valid positive id, never anonymous "0"), it calls `approved_users.py pending-add <chat> <uid>` so the owner can approve them with one tap. This is why a new user just has to message the bot once to show up, no need for them to be a saved contact. The native contact picker (`➕ add by contact` → `users add` → `tg.sh request_user_kb` → `users_shared` → `users approve`) is kept as a secondary path, but it only surfaces contacts/DM'd users reliably, so Pending is the primary flow.
+- **Data:** `commands/users.sh` drives two stores via `scripts/approved_users.py` (single source of truth; CLI for bash, importable module for the renderer; atomic writes): `state/approved_users.json` → `{ "<chat_id>": [ {id, username, approved_at} ] }` (Members) and `state/pending_users.json` → `{ "<chat_id>": [ {id, last_seen} ] }` (Pending, deduped, most-recent-first, capped at `PENDING_CAP`). The module is pure storage; the handler sequences the moves (approve = approved-add + pending-remove; remove = approved-remove + pending-add). `pending_list_room` hides anyone currently approved so the two lists never double-show. The owner is never stored (always allowed). Everything is per-room.
+- **Live:** the listener reads `approved_users.json` **live** (`refresh_approved` re-flattens only on mtime change; `sender_allowed` whole-token-matches the cached `" <chat>:<uid> "` pairs), so a move takes effect on the user's **next message, no restart**. Pending users' @handles are resolved at render time via `getChatMember` (they're stored by id only).
+- **One-time cost:** the gate + its pending capture live in `listener.sh`, so the feature only goes live after one restart (use ♻️ restart); every subsequent move is restart-free. Covered by `tests/test_approved_users.py` (both lists + move semantics) and the routing-completeness check in `tests/test_dispatch.sh`.
+
+Rooms run in parallel: room A can have a spawn in flight while room B is idle and serving slash commands. If an optional browser-automation MCP plugin (such as chromeflow) is installed, each persistent claude process gets its own connection to it for its lifetime; the browser itself is still shared (see "What persistent mode doesn't fix").
+
+Wire-through summary:
+- `listener.sh` exports `CHAT_ID` when calling `handle_action.sh`, `spawn_claude.sh`, and `tg.sh`.
+- `handle_action.sh` resolves `ROOM_DIR` and points `SESSIONS_FILE`/`BUSY_LOCK`/`QUEUE_FILE`/`EFFORT_FILE`/`SCHED_FILE` at the per-room paths.
+- `spawn_claude.sh` resolves `ROOM_DIR` and exports `CHAT_ID` to the claude subprocess so `notify-cmd` (and any other tool that reads `CHAT_ID`) routes back to the originating chat.
+- `tg.sh` reads `TARGET_CHAT_ID = ${CHAT_ID:-$TELEGRAM_CHAT_ID}` and sends to it.
+- `stream_to_telegram.py` reads `TELEGRAM_CHAT_ID = $CHAT_ID or .env`.
+- `schedule_task.sh` writes to the GLOBAL `state/scheduled.json` with an explicit `target_chat_id` per task. The room is resolved via (1) `--target-chat-id` flag, (2) `state/room_registry.json` matching the prompt's project paths/URLs, (3) `$CHAT_ID`. If the prompt belongs to a registered project (e.g. anything mentioning `app.example.com` or `/projects/myapp/`) and the resolved target conflicts with the project's `target_chat_id`, the script REFUSES and exits 2. This is the guard that prevents a project's tasks from ever landing in the wrong room.
+
+To start a new conversation: create a Telegram group (or supergroup with a topic), add `@your_claude_bot`, set its privacy via BotFather (`/setprivacy → Disabled`) so it sees all messages, and talk to it. The first message creates `state/rooms/<group_chat_id>/` automatically. `/status` shows which room you're in.
+
+`notify-cmd` (`scripts/notify-cmd`, which `install.sh` links to `~/.local/bin/notify-cmd`; the bot itself calls whatever `NOTIFY_CMD` resolves to) is the ONLY phone notifier. It routes via `tg.sh` and therefore honours `CHAT_ID` (owner DM when unset), and supports `--tag`, `--photo`/`--caption`, stdin, `--dm` (force owner DM), and `--alert` (route to the global ALERTS channel, see below).
+
+The **alerts channel** is the one chat the owner keeps unmuted; every other room can be muted. It is bound from the 🚨 alerts menu button in a group room (stored at `state/.alerts_chat_id`, data not code, like `.owner_username`). `notify-cmd --alert` sends there, falling back to the owner DM when unbound. For urgent items see "Owner escalation" below: @mentions do NOT push through muted chats on phones, the alerts channel is the reliable path.
+
+## Persistent claude (default mode)
+
+`spawn_claude.sh` runs claude in **persistent mode** by default. Instead of one-spawn-per-message, claude is kept alive reading from `state/rooms/<chat_id>/inbox.ndjson` via `tail -f`. Each Telegram message is appended to that inbox as a single NDJSON line:
+
+```json
+{"type":"user","message":{"role":"user","content":"<your text>"}}
+```
+
+Claude consumes one line per turn. Between turns it waits for the next inbox line. The listener's `dispatch()` appends to the inbox when a spawn is already running, instead of queueing, so your follow-up message lands at the next inter-turn boundary, which mirrors interactive Claude Code's "type while busy, lands at next gap" UX.
+
+What this fixes (vs the previous spawn-per-message model):
+- No more "every turn quits". The conversation stays open. You don't pay context warmup per message.
+- Follow-up messages arrive inside the SAME claude process as additional user turns, not as separate `--resume` runs.
+- `--effort` and tool state persist within the conversation.
+
+What persistent mode doesn't fix:
+- True mid-tool injection. claude only checks stdin between turns, not in the middle of a tool call. So a message you send during a long Bash or browser tool call will wait until that tool returns and the assistant finalises the current turn.
+- Browser contention is unchanged. With a browser-automation plugin such as chromeflow, every room drives the same real Chrome, so only one room should drive it at a time.
+
+Tear-down:
+- `/cancel`: SIGTERMs the spawn pid → `spawn_claude.sh`'s trap pkills tail + claude. Inbox is truncated.
+- Claude crash: spawn exits naturally, `busy.lock` becomes stale and `is_busy()` clears it. Next user message starts a fresh persistent spawn that `--resume`s the same session.
+
+For scheduled cron tasks where Telegram streaming would be wrong, set `CLAUDE_SILENT_SPAWN=1` in the env before invoking `spawn_claude.sh`. Output goes to `logs/spawn.log` only.
+
+**Chrome-tab cleanup for silent spawns.** Only relevant when a browser-automation plugin such as chromeflow is installed. Headless one-shot tasks leak chrome tabs by default: claude opens a page via the plugin, does its work, exits, and the tab sits there forever because no human is watching. To fix this, `CLAUDE_SILENT_SPAWN=1` injects an extra `--append-system-prompt` that instructs claude to inventory open tabs with the plugin's `list_tabs`, then `close_tab` any tab it opened during the run, BEFORE writing its final answer's terminal byte. Tabs that existed at task start are left alone. **Opt-out for keepalives:** if a scheduled prompt depends on a tab persisting across runs (for example a keepalive task that ticks every few minutes to stop a web page or session from expiring), the prompt must EXPLICITLY say "keep the tab open" / "do not close" or similar. Claude is told to respect that override. The wire-level toggle lives in `scripts/spawn_claude.sh`, in the `if [[ "${CLAUDE_SILENT_SPAWN:-}" == "1" ]]` block.
+
+**AskUserQuestion is hidden; `ask_user` is the only path (persistent spawns only).** Claude Code's built-in `AskUserQuestion` tool is built for an interactive terminal; a headless bot spawn has no TTY to render its picker, so calling it silently auto-resolves with a placeholder and the user's real answer never surfaces. This repo's own `ask_user` MCP tool (`scripts/ask_user_mcp_server.py`) does the same job for real: it renders the choice as a Telegram inline-keyboard message and genuinely blocks for the reply. `spawn_claude.sh` passes `--disallowedTools AskUserQuestion` alongside the `--mcp-config` that wires up `ask_user`, in the same conditional block, so the assistant's tool list only ever has ONE tool for asking the user something, never two competing ones. This used to be a `PreToolUse` hook (`hooks/ask_user_redirect.sh`, since deleted) that let `AskUserQuestion` stay visible and intercepted the call after the fact, translating it into the equivalent `ask_user` call; that worked, but left two functionally-overlapping tools in the list for no reason once the system prompt was already telling the assistant by name to use `ask_user`. Testing confirmed Claude reliably reaches for `ask_user` directly (never attempts `AskUserQuestion` first) whenever the system prompt names it, so hiding the native tool outright carries no behavioural risk and removes the redundant bounce. Persistent mode only: one-shot/scheduled spawns never get the `ask_user` MCP server (`--mcp-config` is only appended in the persistent branch), so `AskUserQuestion` is left available there and falls back to its normal silent auto-resolve, same as before. (History: an even earlier version disallowed `AskUserQuestion` with no system-prompt guidance at all; Claude had no way to discover the replacement and got stuck, so it was replaced by the hook. The hook is now gone too, because the missing piece, telling the assistant by name which tool to use, is what actually mattered, not the hook itself.)
+
+Session-id semantics:
+- First persistent spawn in a (room, cwd) writes a fresh `--session-id <uuid>` and persists it to `sessions.json` BEFORE claude reads any input. So `/status` can show the uuid immediately.
+- Subsequent spawns (after a /cancel or crash) use `--resume <uuid>` so the conversation history is preserved.
+
+`queue.jsonl`: one user-message per line, newline-separated. `drain_queue_if_idle()` pops the head when not busy.
+
+## Action reference
+
+Every entry below is a menu button. The "verb" column names the handler file
+(`scripts/commands/<verb>.sh`) and the callback_data payload (`act:<verb> [args]`).
+Users never type these (the bot is menu-driven, see "Menu-first UX" below),
+so the verb is what you grep for in code, not what you type in chat.
+
+| Action | Behaviour |
+|---|---|
+| `help` | Lists the actions. |
+| `status` | Health + full status: bot uptime, busy state, queue depth, effort, model, active cwd, session, last spawn line, recent events. |
+| `cd <name>` | Exact match in `<projects dir>/<name>` (`BOT_PROJECTS_DIR`, default: home) or `$HOME/<name>`. Falls back to prefix/glob (`cd auto` → `auto*`, `cd a*` → glob); multi-match lists candidates and refuses to pick. Refuses paths outside `$HOME`. **Switching to a different dir discards the current session** and kills any in-flight spawn. `cd <same dir>` is a no-op and preserves the session. |
+| `cd <abs-path>` | Absolute form. Same `$HOME` restriction. Same drop-session semantics when the dir changes. |
+| bare `cd` keyboard's `▸` button | Drill-down browse (`scripts/commands/cdbrowse.sh`, verb `cdbrowse`, path relative to the projects dir, `BOT_PROJECTS_DIR`). Any listed directory that has its own subfolders gets a second `▸` button alongside its name; tapping it opens that folder's children with a "✓ Use this folder" / "⬆ Up" pair plus one row per subfolder (itself recursively browsable). Selecting anything still goes through the normal `cd` verb, so cwd-switch/session-drop semantics are unchanged. Exists for monorepo-style dirs (e.g. one repo with `frontend/`, `backend/`, `docs/` as independent contexts) where the target cwd isn't a top-level entry of the projects dir. |
+| `new` | Clears the session_id in the current room. Confirm prompt unless `new yes`. |
+| `windows` (alias `screenshot`) | Captures every visible user window via Quartz (`enum_windows.py` + `capture_window.py`) and sends them as Telegram album(s), so you can audit the whole screen from your phone. Uses the offscreen-buffer capture path so it works even when the display is off or asleep. Menu button labelled 🪟 windows. |
+| `tab <query>` | Find the first Chrome tab whose URL or title contains `<query>` (case-insensitive), bring it to front, capture via Quartz `CGWindowListCreateImage`, send as a Telegram photo with title + URL as caption. Requires a query; bare `tab` opens a picker keyboard listing every open tab. |
+| `effort <level>` | Sets the effort level for every subsequent claude spawn. The bare-`effort` picker gates levels to the room's current model: Haiku has none; Sonnet 4.6 / Opus 4.6 offer `low`/`medium`/`high`/`max`; Opus 4.7 adds `xhigh`; Opus 4.8 / Fable 5 add `ultracode`. `ultracode` is a Claude Code session setting (xhigh + dynamic-workflow orchestration), not an `--effort` value, so `spawn_claude.sh` passes it as `--settings '{"ultracode":true}'` instead. `default` (alias `none`/`reset`) clears it. Backed by `state/rooms/<chat>/effort` (single line). |
+| `cancel` | One tap, no confirm step: kills the in-flight claude spawn for this room only, wipes the queue + inbox, and acks "🛑 Cancelled". Any arguments (e.g. `act:cancel yes`, which older buttons and the tests send) are ignored. With nothing running it replies "Nothing in flight to cancel." (and clears a stale `busy.lock`); the menu button reads `🛑 cancel (nothing running)` in that state. Lives in `commands/cancel.sh`. |
+| `compact` | Main-menu 🗜 button. Injects a `/compact` turn to compress the room's context. Three cases depending on room state: spawn busy with a live inbox → injected immediately (`.compact_in_flight` marker set so the streamer's post-`result` check can fire a completion notify); spawn busy but not yet accepting inbox input (warmup/teardown window) → `.compact_pending` marker, drained ahead of the next real message so it never gets coalesced into that message's text; room idle → same `.compact_pending` marker, consumed by `start_spawn`'s pre-seed step on the next spawn. |
+| `autocompact` | Per-room auto-compact threshold, on the `⚙️ more options` screen (button shows the live value, e.g. `🗜 auto compact: 65%`). Picker offers 40% to 90% in steps of 5, plus `default` (no override, Claude Code's own threshold). Stored at `state/rooms/<chat>/autocompact` (single integer); `spawn_claude.sh` exports it as `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`, which Claude Code turns into a compaction trigger at `min(window * pct/100, window - 13k)` tokens. The env var is read once at spawn start, so `listener.sh`'s stale-spawn check counts this file's mtime: the next message after a change gets a fresh process (session preserved). |
+| `users` | Per-room user management, two sections: **✅ Members** (approved, each with a 🗑 → `users rm <id>`, which revokes + demotes to Pending) and **⏳ Pending** (messaged the bot but not allowed; each with a ✅ → `users approve <id>`, which promotes to Members). Pending fills automatically: the listener's drop path captures blocked senders. `users add` is a secondary contact-picker path (`request_users` → `users_shared` → `users approve`) but is unreliable for group-only members, so Pending is primary. Approvals are scoped to THIS room; the owner is always allowed and never listed. See "Approving extra users (per-room)" below. |
+| `restart` | One-tap listener reload from the menu (♻️ restart), so the owner never needs a Terminal for the restart that `listener.sh` edits require. Bare draws a confirm; `restart yes` acks, then fires a detached, deferred `safe_restart.sh --force` (via `with_setsid.py`, so `kickstart -k` killing the listener's process group doesn't cascade to it). launchd KeepAlive revives the listener with the new code; detached spawns in other rooms survive. It also drops `state/.restart_announce` (the requesting chat id); the rebooted listener calls `announce_restart_if_marked` (lib.sh) to send a "✅ back up" to that room, so the user gets confirmation instead of guessing. That marker is single-use and time-bounded (a failed kickstart can't fire a stale announce on a later crash-recovery boot). The button + route are sourced fresh per tap, so this works even before the pending restart it triggers. `BOT_RESTART_CMD`/`BOT_RESTART_DELAY` override the command/delay for tests. |
+| `mentions` | Toggles the per-room **🔔 @-mentions only** setting (shown on the menu in GROUPS only, hidden in DMs). When ON, in that group the bot acts only on messages that @-mention it and ignores ordinary chatter; OFF (default) it responds to every allowlisted message as before. The gate lives in `listener.sh::dispatch` and reads the setting live, so toggling takes effect on the next message with no restart. The bot's @username (for matching) comes from `getMe`, cached at `state/.bot_username`. `commands/mentions.sh` stores the setting at `state/rooms/<chat>/mentions_only` (`on` = enabled, absent = off). DMs always reply regardless. The `@botname` mention is stripped from the text before Claude sees it. Covered by `mentions_bot` tests in `tests/test_lib.sh` + the toggle test in `tests/test_dispatch.sh`. |
+| `tune` | Combined model + effort screen, the menu's single entry point for both (button label shows current values, e.g. `🧠 opus-4-8[1m] · ⚡ high`). Two sections on one keyboard; the effort section is gated to the CURRENT model and re-renders when a model is tapped. `tune model <alias>` / `tune effort <level>` re-dispatch to the real `model` / `effort` handlers (so model-change-resets-effort semantics hold) and redraw the screen. The shared model→effort matrix lives in `scripts/model_effort.py`, imported by `effort.sh`, `model.sh`, and `tune.sh`. |
+| `more` | The `⚙️ more options` submenu holding the config-rare actions so the main menu stays lean: rooms, chrome tab, schedule, label, verbosity, users, update plugins, login, alerts, restart, and (groups only) the @-mentions toggle. |
+| `alerts` | Manages the GLOBAL alerts channel (the one chat the owner keeps unmuted; everything else can be muted). Bare `alerts` shows the current binding with bind/unbind buttons; `alerts here` binds the CURRENT group room (refused in DMs, the DM is already the fallback); `alerts off` unbinds. Stored at `state/.alerts_chat_id`. Consumed by `notify-cmd --alert` and the assistant's escalation prompt. Menu button (groups only) shows live state: `🚨 alerts: HERE` / `🚨 alerts` / `🚨 alerts: DM`. |
+| `ask_answer` | Invisible wiring, no menu button. Fires when the user taps a button on (or free-replies to) a question the `ask_user` MCP tool asked (see "AskUserQuestion is hidden; ask_user is the only path" above for what that tool is and why it exists). Button taps carry `callback_data = "act:ask_answer __idx__N"` (index into the question's options, kept short to stay under Telegram's 64-byte callback_data limit) or `__skip__`; free-text replies are intercepted earlier, in `listener.sh::dispatch()`, before they'd otherwise be routed as a new user turn. Reads `.ask_user_pending.json` BEFORE writing the answer (avoids a race where the MCP server's own poll deletes the pending file first), resolves the index to real option text, writes `.ask_user_answer` atomically, and edits the question message in place to show the resolved answer with the buttons removed. Outputs nothing to stdout: no separate confirmation message, the edit-in-place is the confirmation. |
+| typed plain text | Routed to `spawn_claude.sh` → claude → streaming reply (or injected into a busy room's inbox). |
+
+## Menu-first UX (and the `act:` wire format)
+
+**User-facing.** The user reaches everything through the inline keyboard at `/menu`. Only `/menu` is registered with `setMyCommands`, so the input bar's `/` autocomplete shows just that one entry. The chat menu button (the four-square icon next to the input) is set to `type=commands` and pops the same single-item list. `/start` aliases to `/menu` so the very first message in a fresh chat with the bot renders the menu.
+
+The menu doubles as a status panel: button labels show the CURRENT model+effort (one combined `tune` button), cwd, session id, busy state. A glance at the menu tells the user where they are. The main menu carries only the daily controls (status, usage, cwd, new, model+effort, windows, cancel, help); everything config-rare lives one tap deeper behind `⚙️ more options` (see the `more` action).
+
+**Typed slash commands reach this bot's dispatcher only for `/menu` and `/start`** (see the architecture diagram above for the routing). Everything else typed with a leading slash goes to Claude as plain text, so Claude Code's own slash commands and skills (`/compact`, `/loop`, `/goal`, custom skill names) work when typed directly into the chat. Previously every non-menu slash was rejected outright, which left no way to type a Claude-side slash command into the chat.
+
+**Wire format.** Inline-keyboard buttons fire `callback_data` strings in one of two shapes:
+- `act:<cmd>[ <args>]`: a real action. Example: `act:effort high`, `act:cd myapp`, `act:cancel yes`. The listener strips the `act:` prefix and routes the rest to `handle_action.sh`.
+- `decor:*`: an inert button (section headers, empty-state placeholders). The listener acks the spinner and drops; nothing else runs.
+
+Anything else in `callback_data` is treated as a stale button from before this format was introduced (or a third party trying to fuzz the wire) and is dropped with a log line.
+
+**Why the `act:` prefix exists.** Before this refactor the wire format was raw slash commands (`/effort high` as both the typed form and the callback payload), and the dispatcher couldn't tell them apart. That meant the "no slash commands" UX claim was contradicted by the wire format. Splitting the two: typed input is parsed by the listener's slash-gate; callbacks are parsed by the listener's `act:` branch; both converge in `handle_action.sh`, which knows nothing about either prefix.
+
+**Back-to-menu invariant.** Every sub-screen renders via `reply_kb` which auto-appends a `⬅ Menu` row (callback_data `act:menu`), so no sub-menu is more than one tap from home. Only the main menu screen itself passes `with_back=0` (a back-to-self button would be useless).
+
+**The menu collapses instead of closing.** `commands/close.sh` (the `act:close` verb, bound to the main menu's own "▾ collapse" button) used to `tg.sh delete` the message; it now uses `reply_kb` to shrink the message down to a single `☰ Menu` button, the same size and shape as the shortcut on turn-end footers below. Tapping the collapsed button re-expands via the ordinary `act:menu` handler, which edits the same message back to the full screen, so the "one tap from home" invariant above still holds; the menu is just visually smaller when you're not using it instead of gone. The collapsed message's text reads `Menu`, matching the button's own label, so the whole bubble is one deliberate unit. Some visible text is required: Telegram's `sendMessage` rejects empty text and also rejects a zero-width space (400 "text must be non-empty", confirmed against the real API). A room-label heading ("🎯 <label>") and a bare middle dot (`·`) were both tried first and dropped as clutter.
+
+**Turn-end footers carry their own shortcuts, via `_new` verb variants, not the ordinary ones.** `stream_to_telegram.py`'s "⏱ Worked for…" message (sent after every completed turn) always carries a `☰ Menu` button via `tg_send`'s optional `keyboard` param, plus a `🗜 Compact` button specifically when context is at or above the same 75% the footer's own ⚠️ emoji warns at. These use `act:menu_new` / `act:compact_new` (`commands/menu_new.sh`, `commands/compact_new.sh`), NOT the ordinary `act:menu` / `act:compact`: the ordinary verbs edit the tapped message in place, which is exactly right for the main menu's own navigation but on the footer it overwrote the turn's own duration/context text. The `_new` variants `unset CALLBACK_MSG_ID` before delegating to the real handler, so `reply_kb` falls through to its own "no `CALLBACK_MSG_ID`, send fresh" branch and the footer survives untouched.
+
+That fix alone created a second problem: a menu sent this way is a brand-new persistent message, and it inherited the ordinary menu's "collapse to a stub" close button, so every tap of the footer's `☰ Menu` left behind one more permanent "Menu" stub next to it, forever, duplicating what the footer's own button already did. `menu.sh` takes the bottom row's button text and verb from `MENU_CLOSE_LABEL` / `MENU_CLOSE_VERB` env vars (default `▾ collapse` / `close`, i.e. the ordinary collapsing behaviour from above); `menu_new.sh` overrides these to `✕ close` / `close_delete` before sourcing it. `commands/close_delete.sh` does a bare `tg.sh delete`, the original pre-collapse behaviour, but scoped to only this one footer-spawned case: a one-off lookup with a real permanent entry point sitting right above it, unlike the user's actual home-base `/menu`, which still collapses as designed.
+
+**The footer's own send is now 429-safe.** BUG FIXED: some turns used to end with no "Worked for…" footer. The footer is a ONE-SHOT `tg_send`, not a streaming edit frame. `tg_api` never blocks on a 429: it sets a cooldown deadline and returns `None` for every call until it passes, which is safe for the edit-in-place streaming path (the next successful flush catches up to the latest buffer state) but fatal for a one-shot send: if the footer's call landed inside an active cooldown window it silently vanished forever with no retry. `logs/stream.log` showed real 429s every few minutes under normal load, so this wasn't rare. `commit_live()` had already solved the identical problem for the streamed reply's own final delivery via `_wait_for_cooldown()` (blocks, capped at `COOLDOWN_WAIT_MAX = 90s`, safe because the streamer is at end-of-stream by then); the footer now calls `_wait_for_cooldown()` before its send and again before one retry if the first attempt fails, mirroring `commit_live`'s pattern exactly. Deliberately NOT applied to `tg_send` generally: tool markers fire mid-turn while claude may still be producing output, and blocking there is the exact "wedging" bug `tg_api`'s own docstring warns against. Covered by `tests/test_footer_survives_429.py`, which 429s only the footer's first send attempt and asserts the retry actually reaches Telegram (not just that an attempt was made).
+
+**`commit_live()`'s cooldown wait is now scoped to true end-of-turn only, not every tool call.** BUG FIXED: a file sent by a tool call used to land in the chat well before the text and tool marker that preceded it. `commit_live()` fires at EVERY `tool_use` `content_block_stop` (finalising pre-tool narration before the tool marker message), not just at true turn end, but it was calling the same unconditional `_wait_for_cooldown()` the end-of-turn path uses, which blocks for up to `COOLDOWN_WAIT_MAX` (90s). `logs/stream.log` showed this firing constantly under normal load: dozens of 15-40s waits per hour. Meanwhile the TOOL ITSELF (e.g. a Bash call to `notify-cmd --photo` / `tg.sh`, the normal way the assistant sends a screenshot or file) executes completely independently of the streamer (Claude Code doesn't wait for `stream_to_telegram.py` to finish processing an event before running the tool), so the photo lands in seconds while the pre-tool text and tool marker sat blocked behind a cooldown wait that had nothing to do with the photo's own delivery, arriving visibly AFTER a file that logically should have preceded it. Fixed via `commit_live(blocking=True)`: mid-turn call sites (the tool-marker commit at `content_block_stop`, mid-stream buffer-overflow rotation in `rotate_message`, the "diff" verbosity edit-render path) now pass `blocking=False`, skipping the cooldown wait AND the failure-escalation notices (worded for a genuinely final delivery) entirely. A dropped mid-turn segment just doesn't show as its own bubble; the tool marker and subsequent text still arrive normally in a fresh box once the tool's own execution time has usually let the cooldown clear for free, the same "drop is fine, the next flush catches up" tolerance the ordinary streaming edit path already has. True end-of-turn call sites (`message_stop`, the `result` envelope, end-of-stdin, and the defensive prior-turn cleanup at `message_start`) keep `blocking=True` unchanged: losing the actual final reply is a much worse outcome than a brief wait. Covered by `tests/test_tool_marker_no_block.py`, which simulates an active cooldown spanning a tool call and asserts zero `_wait_for_cooldown` calls happen before the tool marker is attempted, while the end-of-turn commit still waits as before.
+
+**The streamer's outbound Telegram calls run on background sender threads, not the main stdin-reading loop.** BUG FIXED: tool markers could land well after the file their own tool call sent. A photo sent by a Bash call could land as message N while the tool marker for that same call landed as message N+1, several seconds later, with no 429s or errors logged in between. The cooldown fix above stopped `commit_live()` from *blocking* on a cooldown, but every actual outbound network call (`maybe_flush()`'s repeated draft/edit updates, the tool-marker send, the diff-message send) was still made *synchronously* on the same thread reading claude's stdout: real HTTP round-trips, up to `HTTP_TIMEOUT` (20s) each if slow. Under heavy streaming, the cumulative time spent blocked in those calls can exceed the time claude takes to produce more output, so the reading loop falls behind and a backlog builds up in the stdin pipe. An event claude already emitted (like the `content_block_stop` that should trigger a tool marker) might not get *read*, let alone acted on, for several real seconds, purely because the loop is still working through everything queued ahead of it. A tool's own side effect (a Bash call to `notify-cmd`/`tg.sh`) is a separate subprocess, completely unaffected by any of this, so it lands in about a second while the marker announcing it is still stuck behind unrelated earlier work.
+
+Fixed with **two** independent background sender queues, each with its own single worker thread (`_edit_queue` for `maybe_flush()`'s draft/edit sends, `_marker_queue` for tool-marker/diff-message sends): `_bg_edit()` / `_bg_marker()` enqueue a ready-to-send snapshot and the main loop moves straight on to the next stdin line instead of waiting for the round-trip. **Two queues, not one**, deliberately: an early one-queue version was caught by this fix's own test suite (`tests/test_streamer_no_backlog_block.py`) reintroducing a scaled-down version of the exact bug: a slow tool-marker send would sit ahead of a later, unrelated `maybe_flush` job in the same FIFO line, so anything waiting on "my own edit box is caught up" ended up waiting on the unrelated slow marker anyway, just one hop removed. Splitting the channels means a slow send in one never delays the other, while each channel keeps its own strict internal ordering (single worker per queue).
+
+Three correctness traps this surfaced and fixed along the way, each caught by this file's own test suite when tried and reverted:
+- **`tg_send_draft()` reads the mutable `_draft_id`/`_draft_used_plain` globals at execution time, not at enqueue time.** A queued job from an OLD turn's box, still pending when a NEW turn opens a fresh `_draft_id`, would otherwise land its stale content on the NEW draft slot, or leave `commit_live()` finalising in the wrong format (a visible flash, the exact bug draft streaming exists to avoid). Fixed with `_wait_for_flush_jobs()`, a narrow counter (`_pending_flush_jobs`, incremented at enqueue, decremented on completion) that `commit_live()` waits on *before* touching either global, bounded to whatever's genuinely still pending for the box being closed (typically 0-1 items), never the whole queue.
+- **`_tg_api_lock` (protects `tg_api()`'s shared rate-limit bookkeeping across threads) must not wrap the actual network call**, only the quick state read/write around it; holding it across a slow `urlopen()` would mean the main thread's own synchronous end-of-turn send has to wait for an unrelated background call to finish, reintroducing the same blocking bug one layer down. Tried holding it for the whole call first; caught by the same test.
+- **`_tg_api_lock` must be an `RLock`, not a plain `Lock`.** `_cancel_handler` (SIGTERM/SIGINT, i.e. `/cancel`) runs on the main thread and can itself call `tg_api`/`tg_edit`/`tg_clear_draft`. Python delivers a signal by interrupting the main thread's current call and running the handler right there; if that happens while the main thread is already inside the lock (mid network call in a blocking=True `commit_live()`), a plain `Lock` would self-deadlock the instant the handler tried to send its own cancellation message.
+
+**New messages are sent strictly in issue order (send-order tickets).** BUG FIXED: replies and tool markers often appeared out of order. The two queues above gave no ordering *between* channels: a tool marker went out on `_marker_queue` while the next bubble's placeholder (`ensure_live()`'s `tg_send("…")`, or the footer) was sent straight from the main loop, and Telegram positions a message by when its `sendMessage` lands, so whichever HTTP call finished first won. Under load the marker routinely lost, and replies appeared above the tool call that produced them. Markers could land many seconds late, after the text that followed them. Fix: `tg_api` is now a thin wrapper around `_tg_api_raw`, and every `sendMessage` takes a ticket (`_seq_take`) in issue order, then may only send once every earlier ticket has finished (`_seq_wait` / `_seq_done`). `_bg_marker()` takes its job's ticket at *enqueue* time on the main thread, not when the worker runs it, so a queued marker is always ahead of anything issued after it. Edits to an existing message take no ticket (they never move a message), so streaming into a live bubble never waits on this. **The deliberate trade-off:** the main loop now waits for an in-flight marker before opening the *next* bubble (normally one round-trip, a fraction of a second); it never waits on a backlog. Bounded by `SEQ_WAIT_MAX` (`HTTP_TIMEOUT` + 5s) so one hung send can't wedge the rest. `_cancel_handler` sets `_seq_bypass` first: it runs on the main thread, which may itself be parked in `_seq_wait` holding an earlier ticket, and order no longer matters once cancelling. Not covered: files uploaded by the assistant's own Bash calls (`tg.sh`/`notify-cmd` run as separate processes), which is why the system prompt tells it to send files without pre-narration. `tests/test_streamer_no_backlog_block.py` was rewritten around this: it asserts the on-screen (arrival) order is pre-tool text, marker, post-tool text, footer, and that the loop waits for at most the one slow send. On the pre-ticket streamer the slow marker lands last, after even the footer.
+
+Both queues are fully drained (`.join()`) before `main()` returns and in the crash-handler's exception path: background threads are daemon threads, so anything still queued when the process exits would otherwise be silently lost. This is the one place a full, unscoped wait is correct: it only runs at genuine process exit, not on the hot path.
+
+Covered by `tests/test_streamer_no_backlog_block.py` (an artificially slow tool-marker send must not delay the loop from reaching and processing the rest of the turn, but its background thread must still be waited for before the process exits) and `tests/test_draft_streaming.py` (the draft_id/format correctness properties above). `tests/test_too_long_recovery.py`'s `test_split_sends_tail_as_new_message` was rewritten to fail `editMessageText` by *content* rather than by *call count*. The count-based version was coupled to exactly how many editMessageText calls happen before the real payload's own recovery cycle (including the "💭 Thinking…" placeholder's own edit), which legitimately shifted once `commit_live()` started skipping a redundant retry it can now prove is doomed (see `known_too_long` in `commit_live()`, fed by a maybe_flush background job that already discovered MESSAGE_TOO_LONG before the turn ended), a strictly more efficient outcome, not a regression, but the old test design couldn't tell the difference.
+
+## Rate-limit auto-continue (429 handling)
+
+A spawn that dies on a Claude rate limit is NOT treated as a crash. `spawn_claude.sh`'s exit path scans the tail of the room's `claude.stream.jsonl` for the structured `rate_limit_event` (status + `resetsAt` epoch) and 429/usage-limit error text. On a hit it: keeps the `session_id` (a 429 is not a poisoned context), skips the circuit-breaker stamp, salvages unanswered inbox messages into `queue.jsonl`, writes the reset epoch to `state/rooms/<chat>/.rate_limited_until`, and sends one `notify-cmd --alert` naming the auto-resume time. While that marker is in the future: `drain_queue_if_idle` skips the room, new user messages queue with a 😴 react instead of spawning into a guaranteed second 429, and scheduled fires queue too. When the epoch passes, the next drain pass removes the marker and re-spawns the queued messages with `--resume`; that respawn IS the auto-continue, full context intact.
+
+**The park time trusts the real reset, up to the weekly window.** BUG FIXED: rooms on a weekly limit used to retry, and post a fresh rate-limit notice, every 5 minutes. Every park-time calculation (`stream_to_telegram.py::_park_room_for_rate_limit` and both inline blocks in `spawn_claude.sh`) only trusted `resetsAt` within 6 hours, a bound written for the 5-hour window. A weekly (`seven_day`) limit resets days away, so its real reset was thrown out and replaced with the "retry in 5 minutes" fallback: each room resumed, hit the same weekly limit, re-parked for 5 minutes and posted another "⏸ Rate limited" message, around the clock, only stopping once the reset came within 6h. Every failed retry also left the queued user message as another turn in the session history, so one message could be delivered many times over. The bound is now `RL_MAX_PARK_S` = 8 days (weekly window plus slack). Separately, the streamer sends its "⏸ Rate limited" message at most once per room per hour (`.rate_notice_at`, `RATE_NOTICE_QUIET_S`), so even a genuine fallback loop can't spam. Covered by `tests/test_park_room_rate_limit.py` cases 4-6 (weekly resets 15h and 3 days out, both `spawn_claude.sh` blocks, the notice throttle).
+
+Salvage precision: the streamer bumps `state/rooms/<chat>/.turns_done` on every clean `result` envelope (the spawn zeroes it at start), and the salvage skips that many leading inbox lines, so only messages whose turn never completed are re-queued (the inbox holds every line of the spawn's lifetime; without the counter a crash after N good turns re-delivered all N answered messages).
+
+Alerts-channel dedup is GLOBAL, not per-room (`lib.sh::should_alert_rate_limit`, keyed on `(resume_at, limit_type)`, backed by `state/.rl_alerted`). Every room shares one Anthropic account and therefore one set of rate-limit windows, so subagent-heavy parallel work routinely trips several rooms against the SAME shared limit within moments of each other. Previously each room tracked its own `.rl_alerted`, so N simultaneously-affected rooms sent N alerts for what was really one account-wide event. The dedup window is `RL_ALERT_DEDUP_S` (setting, default 7200s). A genuinely different limit (a different type, or the same type resetting at a different epoch) still alerts fresh; the per-room in-room `notify-cmd` ping (no `--alert`) is unaffected, every room still tells its own chat it's parked.
+
+## Reaction lifecycle: 🫡/😴 "queued" must resolve to 👍 "answered"
+
+A message sent while a room is busy gets an immediate honest-effort react (🫡 "written down", 😴 "on a rate-limit hold", or the live `spawn_state.emoji_for_injected_state()` mapping for the direct-inject case), but originally nothing updated it once Claude actually processed that message, so it stayed at 🫡 forever, even long after being answered.
+
+Fixed for the direct-inject path (a message landing in a room that's busy AND has a live inbox consumer, the "mid flow" case) via `state/rooms/<chat>/.pending_reacts`: `listener.sh`'s `inject_to_inbox()` pushes one line per `inbox.ndjson` line it writes, a JSON array of the Telegram `message_id`s that line represents (`[]` for synthetic injects like `/compact`, which nobody reacts to). Because "Claude consumes one line per turn" (see "Persistent claude" above), this stays strictly 1:1 with `inbox.ndjson` by construction. `stream_to_telegram.py` pops the oldest line on every completed **non-error** `result` (same gate as the `.turns_done` bump right next to it, an errored turn doesn't consume its inbox line either, so the two counters must move together or desync) and fires `setMessageReaction` with 👍 for every id in it.
+
+**Telegram restricts `setMessageReaction` to a fixed curated emoji set.** The original choice, ✅ (WHITE HEAVY CHECK MARK), is NOT in that set, so every call silently 400'd with `REACTION_INVALID` until the emoji was changed. `tg_api`'s own error logging to `logs/stream.log` had been catching every failure the whole time, nothing was watching it. Now uses 👍, from the same standard set 🫡/😴/👀 already draw from successfully elsewhere in this file. If you ever change this emoji again, verify it against Telegram's actual valid-reactions list first, don't assume any Unicode emoji works.
+
+Every place that truncates `inbox.ndjson` (crash salvage and the self-seed branch in `spawn_claude.sh`, the circuit-breaker trip and `start_spawn`'s own truncate in `listener.sh`, `kill_room_spawn` in `lib.sh`) ALSO truncates `.pending_reacts` in the same breath, so a crash mid-turn can't leave a stale entry that misattributes a later, unrelated turn's 👍 to the wrong message, worst case it just degrades to "this one message's reaction never updates," exactly the old behaviour, never a wrong-message update.
+
+**Deliberately NOT covered by this fix**: messages that get queued into `queue.jsonl` (busy-without-a-live-inbox-consumer, a rate-limit hold, or the idle-burst debounce) and later coalesced by `drain_queue_if_idle`. Threading message_ids through `queue.jsonl`'s several append/truncate sites (both files) without risking a line-count desync was judged disproportionate to the benefit; those reactions still work exactly as before (fire once at queue time, never update). Worth revisiting if it turns out to matter in practice.
+
+## Two cancel markers (don't confuse them)
+
+Two on-disk markers signal "user-initiated cancel" but to different consumers, so a single marker would race:
+
+- `state/rooms/<chat>/.cancel_requested`: read by `stream_to_telegram.py`'s SIGTERM handler. If present at SIGTERM time, the streamer paints "🛑 cancelled" on the live message and deletes the marker. Without this distinction, parent-restart kills (`launchctl kickstart`) would all paint cancelled.
+- `state/rooms/<chat>/.user_cancel`: read by `spawn_claude.sh`'s post-exit logic. If present when claude exits non-zero, the wrapper PRESERVES `session_id` (user asked to interrupt, not to throw away context). If absent and exit ≠ 0, the wrapper RESETS `session_id` to avoid resuming into a poisoned (rate-limited, OOMed, network-broken) context.
+
+`lib.sh::kill_room_spawn` touches both when invoked with `paint_cancel=1`. The streamer-marker is deleted by the streamer; the wrapper-marker is deleted by the wrapper. They never race because they have non-overlapping readers.
+
+## DESIGN AXIOM: nothing in this bot may hardcode chat ids or per-project mappings
+
+**Never hardcode a solution using chat IDs or another similar fixed-identifier method. Routing, room binding, project recognition and validation must all derive automatically from observable state (the calling room's `active_cwd`, the prompts content, the file paths it touches). Code that names a literal chat id, project name, or path prefix inline is a bug.**
+
+The exceptions are `state/room_registry.json` and `state/approved_users.json`, which are data, not code. Registry entries are seeded automatically (auto-learned on first use, see "Scheduled tasks route by per-task `target_chat_id`" below) and only edited by hand to relocate or correct an auto-learned binding. `approved_users.json` is written only by `approved_users.py` in response to an owner-driven contact pick (see "Approving extra users (per-room)"); both files key everything on chat/user ids discovered at runtime, never inlined. Any new routing rule a future change introduces must follow the same shape: discover the binding at runtime from observable state, persist it, validate it on subsequent use. Do not inline `if chat_id == "-1001000000001"` or `if "myproject" in prompt` anywhere in the codebase.
+
+## Machine-specific settings
+
+Nothing machine-specific is hardcoded. Each setting is read from the environment, then `.env`, then a default, via `lib.sh`'s `bot_config KEY DEFAULT` (bash) or `scripts/bot_config.py`'s `get()` (Python); keep the two in step. Named helpers: `bot_label`, `projects_dir`, `notify_cmd`, `claude_bin`, `bot_name`, `bot_python`. The full list with defaults is in `.env.example` and README "Configuration". When adding code that needs a path, a label, a port or a host, add a key there rather than writing the value inline.
+
+## Critical gotchas baked into this code
+
+- **Never bulk-source `.env`.** Use `extract_var KEY` (awk `^KEY=` extractor). Bulk-sourcing can leak unrelated variables into claude's env (for example an `ANTHROPIC_API_KEY` meant for some other endpoint or proxy), which makes claude auth against the wrong endpoint and fail with `Invalid API key`.
+- **launchd PATH must include nvm node bin.** The plist PATH must contain node's bin dir: claude's plugin SessionEnd hook does `#!/bin/sh ... node ...` and exits 1 if node isn't on PATH. `install.sh` writes it in automatically from `command -v node`, falling back to the newest `~/.nvm/versions/node/*/bin`.
+- **launchd PATH must include `/usr/sbin`, for `screencapture`.** `install.sh`'s plist PATH used to omit it (symptom: `screencapture: command not found` in `logs/windows.log`), which silently killed `commands/windows.sh`'s `screencapture -l` fallback (the one that covers whenever the primary Quartz `CGWindowListCreateImage` path in `capture_window.py` also fails, e.g. missing Screen Recording permission, see the next bullet). Fixed two ways: `windows.sh` now calls `/usr/sbin/screencapture` by absolute path (live immediately, no restart), and `install.sh`'s plist PATH now includes `/usr/sbin` for any other bare macOS system binary a future handler might call (needs `./scripts/install.sh` + a restart to take effect for anything relying on the plist PATH itself).
+- **Screen Recording permission is per-binary and can silently lapse.** `/windows`'s primary capture path (`capture_window.py`'s `CGWindowListCreateImage`) needs macOS's Screen Recording permission granted to the EXACT binary running it: `.venv/bin/python3` resolves (via a symlink chain) to a versioned interpreter path (e.g. under Homebrew's Cellar). Recreating `.venv` (a new binary identity) or upgrading Python (a new version-numbered path) both silently revoke the grant, since it's the exact binary macOS checks, not the `.venv/bin/python3` symlink. Symptom: `logs/windows.log` shows `CGWindowListCreateImage returned None ... Screen Recording permission is missing`. Fix (System Settings → Privacy & Security → Screen Recording → add the resolved python binary, found via `readlink -f .venv/bin/python3`, then toggle it on): this is a macOS TCC grant, not something a script can set programmatically, so it's an unavoidable manual step whenever the underlying binary changes.
+- **`CLAUDE_HOOKS_SUPPRESS_TELEGRAM=1` is set when spawning claude.** Avoids the global Notification/Stop hook re-firing during a child claude run.
+- **Bot identity + sender bracket.** `spawn_claude.sh`'s always-on `--append-system-prompt` tells claude its name (the `BOT_NAME` setting, default `Claude`, read via `lib.sh`'s `bot_name`) and that it's on Telegram (not a terminal). An optional persona can be set with `BOT_PERSONA`: when non-empty it is appended as its own `--append-system-prompt "Persona: ..."`; when unset (the default) no persona is added. The listener prefixes every plain-text user message with a bracket before injecting/spawning: `[Telegram]: ...` in a DM, and `[<Name>, Telegram]: ...` in GROUP chats (negative `chat_id`), so the assistant can tell who is speaking when several people share a room. A time-gap field is added (e.g. `[Telegram, +1h15m later]`) when a message arrives at least 20 minutes after the previous one. The name comes from a `from_name` TSV field the parser emits (`dname()` → `first_name` else `username`, sanitised); `dispatch()` takes it as a 3rd arg and labels only the plain-text→claude path (never the menu/slash/cb paths). Covered by `tests/test_listener_parse.sh`.
+- **Owner escalation (groups only): alerts-channel push.** Phone Telegram clients do NOT push @mentions through a muted group (iOS has no mention-exception toggle, unlike some desktop clients), so the urgent channel is the owner's always-unmuted ALERTS channel (bound via the 🚨 alerts menu → `state/.alerts_chat_id`; owner-DM fallback when unbound). `spawn_claude.sh` injects an extra `--append-system-prompt` into GROUP spawns (negative `chat_id`) telling the assistant: if stuck and strongly needing the user's attention (blocked on input, time-sensitive sign-off, an explicitly-requested flag), run `notify-cmd --alert --tag "[<room label>]" "<one-liner>"`; never for routine output, that would defeat the mute. The room label comes from `state/rooms/<chat>/label`. DMs skip the injection entirely. An earlier iteration also had the assistant @mention the owner in-room; that was removed, the alert push is the whole mechanism.
+- **Markdown → Telegram HTML conversion is centralised in `scripts/md_telegram.py`.** Both `stream_to_telegram.py` (streaming claude replies) and `tg.sh` (slash-command replies, notify-cmd) call `md_to_telegram_html`. Supported subset: `**bold**`, `*italic*` / `_italic_`, `` `inline code` ``, `` ```fenced code``` ``, `~~strikethrough~~`, `# headings` (→ bold), `- bullets` (→ `•`), `> quoted lines` (each run → one native `<blockquote>`, markers stripped, so quoted text copies cleanly with no `>` on every line), `---` rules (stripped), pipe-tables (ALWAYS reflowed to proportional-font lines, never `<pre>`: Telegram draws monospace smaller than body text and wraps wide grids into fragments, so neither reads well on a phone. 2-col tables become `• **key:** value` lines; 3+-col tables become one line per row, bold lead cell plus header-labelled fields joined with `·`, so cell markdown actually renders and lines wrap gracefully on phones). Pure html-escape carries everything else through. Run `python3 scripts/md_telegram.py` for the self-test pack and `python3 tests/test_streamer_smoke.py` for the streamer regression check (no real Telegram calls; mocks `urllib.request.urlopen`).
+- **Tool markers ARE sent as their own messages.** Earlier versions sent `🔧 toolname` / `💭 thinking…` on every `content_block_start` and pushed the live edit-in-place answer above a wall of trailing pings, so an earlier fix made the streamer no-op those events. A tool marker was later reintroduced, but on `content_block_stop` instead (once the tool's full input has streamed in, e.g. `⚙️ *Bash* \`notify-cmd --photo ...\``), gated by the `verbosity.tool_calls` / `verbosity.edits` settings (`off` suppresses it). `commit_live()` runs first to flush any pre-tool narration as its own bubble, so the visual order is text, then tool marker, then (after the tool returns) more text, each a discrete message, not one wall. See "`commit_live()`'s cooldown wait is now scoped to true end-of-turn only" above for a real bug this mid-turn commit call caused. `💭 thinking…` placeholders (a DIFFERENT mechanism, the "Thinking with X effort…" live box primer) are separate and still governed by `verbosity.thinking`.
+- **Adjacent text content-blocks get a blank-line separator.** Claude emits pre-tool narration, post-tool commentary, and the final answer as separate `text` content_blocks. Without a separator they concatenate into run-on prose (`"...as required.Good, platform files read.Now I'll..."`). The streamer inserts `\n\n` on `content_block_start` for `type=="text"` when the buffer is non-empty. Verified by `tests/test_streamer_smoke.py`.
+- **Between-tool narration can arrive as thinking blocks.** Opus 5.5 and Fable 5.1 send the short notes written between tool calls as `thinking` content blocks (`thinking_delta` text) instead of `text` blocks. Real reasoning still streams with empty thinking text, so the streamer renders any non-empty `thinking_delta` exactly like a `text_delta` (with the same paragraph separator, added lazily on the block's first visible chunk). BUG FIXED: the streamer used to drop all thinking content, so on these models every between-tool note silently vanished. Covered by `tests/test_thinking_narration.py`.
+- **`user` envelopes don't always carry a block list.** After a `/compact`, Claude Code sends the conversation summary (and `<local-command-stdout>Compacted</local-command-stdout>`) as `user` messages whose `content` is a plain string. The streamer's tool-result handler must skip non-list content and non-dict items. BUG FIXED: the handler used to iterate the string character by character, which crashed the whole streamer on `str.get()` right after a successful compaction, and the post-`result` `.compact_in_flight` check never ran, so the 🗜 compact button never produced its "Context compressed." confirmation. The crash also took the room's spawn down (session preserved, so nothing lost). Covered by `tests/test_compact_completion.py`.
+- **A rate-limited "💭 Thinking…" delete is retried before the footer.** Removing the placeholder (when a turn goes straight to a tool call, or ends without text) is one `deleteMessage`, and during a 429 cooldown `tg_api` skips it without trying, so the bubble used to stay in the chat forever, right above the reply and the "Worked for" footer. BUG FIXED: a replay of real turns with a 429 on each placeholder delete stranded the placeholder every time. `commit_live()` now deletes via `_delete_placeholder()`, which records any delete that didn't go through in `_stale_placeholders`; the `result` handler calls `_retry_stale_placeholders()` right after the final `commit_live()`, which waits out the cooldown and retries each once, before the footer is sent. Covered by `tests/test_thinking_placeholder_429.py`.
+- **`/tab` requires the `.venv` virtualenv at the repo root.** Holds PyObjC's Quartz framework, which is needed to enumerate visible windows via `CGWindowListCopyWindowInfo` and capture them via `CGWindowListCreateImage`. Apple's bundled python3 doesn't ship PyObjC. To re-create: `python3 -m venv .venv && .venv/bin/pip install pyobjc-framework-Quartz` (or just re-run `scripts/install.sh`). The `.venv/` directory is gitignored.
+- **Monitor-off capture.** `screencapture -l` reads from the rendered display framebuffer; when the display is off it returns empty or all-black PNGs. `/tab`'s primary capture path is `scripts/capture_window.py` (Quartz `CGWindowListCreateImage`), which reads each window's offscreen buffer and works regardless of display state.
+- **Case-insensitive verb matching.** `handle_action.sh` lowercases the command token before matching the case statement, so callback payloads like `act:Effort high` would still route to the effort handler. ARGS retain original case. (User-facing typing doesn't reach the verb path any more, since only `/menu` and `/start` reach the dispatcher, but the case-fold is preserved as belt-and-braces for any future caller.)
+- **Queue is coalesced on drain.** When the in-flight spawn ends, `drain_queue_if_idle` collects ALL queued lines, joins them with blank-line separators, and spawns ONE claude run with the combined prompt (rather than N separate spawns), preserving session continuity via `--resume`.
+- **Stream-json input is the live model.** `claude --input-format=stream-json` reading user-message NDJSON off `tail -f inbox.ndjson` IS how persistent mode works today (see "Persistent claude"); this bullet used to describe it as future work. The remaining genuinely-future piece is mid-tool injection: claude only consumes inbox lines at inter-turn boundaries, never during a tool call.
+- **Telegram edit rate.** Capped at one edit per ≥600 ms per message in `stream_to_telegram.py`. Telegram safely handles ~2 edits/sec per message; 600 ms is comfortably under.
+- **Native draft streaming (DMs only, a Telegram limitation).** `stream_to_telegram.py` streams via Bot API 9.5+ `sendMessageDraft` in DMs (positive `chat_id`), which renders a smooth animated preview the final real message replaces, far nicer than `editMessageText`'s stepwise repaint. **Groups can't use this**: `sendMessageDraft` against a group `chat_id` is rejected with `400 TEXTDRAFT_PEER_INVALID` (drafts are peer-to-peer; a group is not a valid draft peer). This is a hard Telegram limitation, not a config choice: groups/topics (negative `chat_id`) keep the edit path, and even a bypassed gate self-heals via the draft→edit fallback. Draft frames flush every `DRAFT_INTERVAL` (0.25s) vs the edit path's `EDIT_INTERVAL` (0.6s). `draft_mode()` is evaluated dynamically off the current chat id (not frozen at import, so tests can flip it). `BOT_DRAFT_STREAMING=0` disables it everywhere. **The no-flash invariant:** the final `sendMessage` must be byte-identical (text AND parse_mode) to the last draft frame shown, or the client repaints the whole bubble and flashes. `commit_live()` enforces this: it finalises in the same format the last frame used (HTML normally; plain text if Telegram spuriously 400'd the HTML frame and we fell back). Covered by `tests/test_draft_streaming.py`. A live demo that streams to your own DM: feed synthetic stream-json NDJSON into the streamer with `CHAT_ID=<your dm id>`.
+- **Files sent to the bot are saved to `~/Downloads`.** Documents, videos, round video notes, GIFs (`animation`), audio and voice notes all go through the same `listener.sh` branch: `tg.sh download_file` (getFile, then the file URL), then a "Saved **name** to ~/Downloads" reply. Media without a `file_name` gets one generated from its kind, the message date and `message_id` plus a mime-derived extension (`video_<date>_<msgid>.mp4`, `voice_<date>_<msgid>.ogg`), since an album's items share one date and would otherwise overwrite each other. Photos are separate: they also save (as `photo_<date>_<msgid>.jpg`), and a captioned photo is injected into Claude's inbox as an image. Every download also goes through `unique_download_dest`, which never overwrites an existing file (`name.ext` → `name_1.ext`, `name_2.ext`...). BUG FIXED: photos used to be named by the second only (`photo_<date>.jpg`), so a burst of photos sent in the same second overwrote each other. **The cloud Bot API refuses `getFile` above 20 MB**, which most phone videos exceed; the listener detects "file is too big" and says so in plain English instead of the raw error. Lifting that cap needs a self-hosted Bot API server via `TELEGRAM_API_BASE`. Previously everything except documents and photos hit the "I only understand text" reply and was dropped. Covered by `tests/test_listener_parse.sh` and `tests/e2e/test_media_download.py` (HOME pointed at a throwaway dir).
+- **Telegram caption cap.** sendPhoto captions max 1024 chars; keep `notify-cmd --photo` captions comfortably under that.
+- **`getUpdates` is single-consumer.** Telegram rejects concurrent pollers on the same bot token with 409 Conflict. Only the launchd listener should hold the poll. Never run `getUpdates` manually against this bot while the listener is up.
+- **/cancel mid-stream.** Works because the listener polls with a 5 s timeout while busy. /cancel goes from phone to Telegram to listener within seconds, then pkill kills the spawn. Other messages received while busy go into `queue.jsonl`.
+- **`/cd <newdir>` is destructive by design.** Switching the active cwd drops the room's `session_id` and kills any in-flight spawn. This is deliberate: switching projects almost never wants the old context, and a stale per-cwd resume map made `/cd` confusing. To keep a long conversation alive, make a new Telegram group chat with the bot (each group is its own room with its own session). Same-dir `/cd` is a no-op.
+- **Scheduled tasks route by per-task `target_chat_id`, not by file location.** `state/scheduled.json` is a single global file. Each entry has an explicit `target_chat_id`; the listener fires into that chat regardless of where the entry sits. `schedule_task.sh` validates the resolved `target_chat_id` against `state/room_registry.json` and REFUSES misroutes (e.g. a prompt for a registered project that would land anywhere other than that project's bound chat). The registry is the editable source of truth: add a project entry there before scheduling work for a new project, do NOT silently widen the prefix list to "fix" a refusal. Three independent layers guard this: registry refusal at write, `target_chat_id` required at fire (check_schedule.py drops entries missing it), and the listener routes by the field. Covered by `tests/test_schedule_routing.py`.
+
+## Metrics & dashboard
+
+A structured event feed plus a local, Grafana-style visual dashboard, added because everything about the bot's health used to live only in scattered, human-readable log lines with no aggregate view.
+
+- **`state/metrics.ndjson`**: one JSON line per event, append-only, never rotated by this repo's own code (grows unbounded on disk; trim by hand if it ever matters; `dashboard.py`'s own reads are windowed to the last 24h regardless of file size). Two writers produce the identical schema: `scripts/lib.sh`'s `emit_metric` (bash: `listener.sh`, `spawn_claude.sh`, `commands/restart.sh`) and `scripts/metrics.py`'s `emit()` (python: `stream_to_telegram.py`). `emit_metric` deliberately builds JSON by hand in bash rather than shelling out to python per call. `code_mtime()`'s multi-fork cost (see `maybe_auto_restart` below) is the exact lesson: these calls run from hot paths (every dispatched message, every turn), so forking an interpreter per event would reintroduce that same class of overhead.
+- **Event vocabulary:** `turn_end` (room, duration_ms, is_error, ctx_pct), `crash` (room, exit_code), `rate_limit_hit` / `rate_limit_resume` (room), `tg_429` (room, backoff_level), `dequeue` (room, count: the coalesced-batch size, from either the busy-not-ready queue path, the rate-limit-hold path, or the idle-burst debounce), `restart_auto` / `restart_manual`.
+- **`scripts/dashboard.py`**: a local web dashboard, stdlib `http.server` only (no dependencies). Serves `/` (a single self-contained HTML/CSS/JS page: dark theme, stat tiles + small-multiple time-series charts) and `/api/snapshot` (the JSON the page polls every 5s). `build_snapshot()` is a plain function of `(repo_root)`, kept separate from the HTTP layer specifically so it's unit-testable without starting a server (`tests/test_dashboard_snapshot.py`). It aggregates `metrics.ndjson` (turn counts/latency/errors/429s/restarts over 5-minute buckets) and cross-references live per-room status via `spawn_state.classify()` (idle/busy/rate-limited/crash-looping badges).
+- **Bound to `127.0.0.1` only, by design.** This is a single-user local dashboard for a bot that otherwise has zero inbound network listeners (only outbound calls to Telegram/Anthropic). Do not change the bind host without adding auth first; see `dashboard.py`'s own docstring.
+- **Run it:** `python3 scripts/dashboard.py` (foreground, default port 8787), or install as a persistent launchd job with `scripts/install_dashboard.sh` (separate plist/label from the main bot, `<BOT_LAUNCHD_LABEL>-dashboard`, so the two can be started/stopped independently). `--port` / `BOT_DASHBOARD_PORT` overrides the port.
+- **`maybe_auto_restart` (listener.sh)**: the listener's own equivalent of the per-room stale-spawn refresh above, but for the listener process itself. Compares `.listener_started_at` (written at boot) against `code_mtime()`; if `scripts/`/`hooks/` changed since boot, fires the same detached kickstart the ♻️ manual restart button uses (`BOT_RESTART_CMD`/`BOT_RESTART_DELAY`, overridable; see the manual restart's own comment for why it must be detached, not synchronous). Throttled to check at most once every `BOT_AUTO_RESTART_CHECK_INTERVAL_S` (default 5s), **not** once per loop iteration; `code_mtime()` forks a `stat` per matching file (40-50+ forks on this repo) and calling it unthrottled on every iteration (including the tight ~1s cadence while any room is mid-debounce) was enough overhead under load to intermittently starve the loop for many seconds (found chasing e2e-suite flakes). A separate `BOT_AUTO_RESTART_COOLDOWN_S` (default 15s) then gates the actual trigger so a detached kickstart already in flight doesn't get re-fired every check. No visible badge, same "invisible" precedent as `.stale_refresh`. Does NOT replay the message that revealed the staleness through the fresh process (that would mean killing mid-dispatch and racing the offset-advance write); that one message still answers on the old code, exactly as if a human had forgotten to restart; the win is every message after it, automatically, no manual step. Covered by `tests/e2e/test_auto_restart_on_stale_code.py`.
+- **Idle-room message-burst debounce (`listener.sh`, `dispatch()`'s idle branch + `drain_queue_if_idle`'s `.debounce_until` gate).** Telegram splits one long paste into several separate messages sent back-to-back; before this existed, each fragment landing on an idle room spawned its own turn immediately: claude answering a sentence cut off mid-thought, then the leftover fragment as an unrelated second turn. Fix: an idle room's first message no longer spawns immediately. It buffers into `queue.jsonl` and stamps `.debounce_until = now + DEBOUNCE_WINDOW_S` (default 2s, `BOT_DEBOUNCE_WINDOW_S`), refreshed by every additional message that lands before it expires (the room stays genuinely idle the whole time, so this is safe): quiet-period semantics, not a fixed delay. `drain_queue_if_idle` only drains once the quiet period is actually reached, reusing the exact same multi-message coalescing already used for the busy-not-ready and rate-limit-hold queue paths. The main loop's poll timeout shortens to 1s while any room is mid-debounce so the flush is noticed promptly. Covered by `tests/e2e/test_idle_burst_debounce.py`.
+
+- **Busy-room inject-burst debounce (`listener.sh`, `dispatch()`'s busy+ready branch + `drain_inject_burst`'s `.inject_debounce_until` gate).** BUG FIXED: a long paste split by Telegram into several messages could be answered after only the first fragment arrived (e.g. a long list answered after only its first few items, with claude noting that the message was cut off). The idle-room debounce above only covers a room with NO live spawn; `is_busy()` is true for a room's entire persistent-conversation lifetime (the wrapper stays alive between turns, not just during one), so almost every message after the first goes through the OTHER branch: straight `inject_to_inbox`, no debounce at all. If a burst's first fragment happens to land at the exact instant the room is sitting between turns (`spawn_state.classify()` state `"idle"`, about to read the very next inbox line), claude answers that fragment alone before the sibling fragments (arriving a beat later over the network, as with any Telegram-split paste) even reach the inbox. When the room is mid-generation instead, this can't happen: claude won't read stdin again until the current turn ends, so fragments land and coalesce naturally regardless of debounce. Fix: the busy+ready branch now classifies the room before injecting; only in the "idle between turns" state does it buffer into `.inject_burst.jsonl` / stamp `.inject_debounce_until` (same `DEBOUNCE_WINDOW_S`) instead of injecting immediately. `drain_inject_burst` (paired with `drain_queue_if_idle`, called at the same two call sites) flushes the coalesced burst as ONE `inject_to_inbox` call once the window elapses, falling back to `queue.jsonl` if the spawn died mid-window. `any_room_debouncing` (and therefore the main loop's short poll timeout) now checks both debounce markers, and is checked BEFORE `any_room_busy` in the timeout decision, since this debounce case is by definition also a busy case. Reaction emoji (👀 vs 🫡) is unchanged either way: the message IS about to be seen shortly regardless of which path it took. Covered by `tests/e2e/test_busy_burst_debounce.py`, which stubs the sandboxed copy of `spawn_state.py` to unconditionally report `state=="idle"` (fake_claude.py never writes the real Claude Code transcript classify() depends on, so the real "idle between turns" detection can't be exercised without a stub).
+
+## Maintenance recipes
+
+- Rotate the OAuth token: `claude setup-token` interactively, paste new value into `.env`, replace the `CLAUDE_CODE_OAUTH_TOKEN` line.
+- Rotate the bot token: BotFather `/revoke` then `/token`, edit `.env`, restart listener.
+- Restart listener (from your phone): tap ♻️ restart on the menu (the `restart` action). Or from a shell: `scripts/safe_restart.sh --force` (shows what's running, then kickstarts), or `launchctl kickstart -k gui/$UID/<BOT_LAUNCHD_LABEL>`. The old unload/load pair still works too: `launchctl unload ~/Library/LaunchAgents/<BOT_LAUNCHD_LABEL>.plist && launchctl load ~/Library/LaunchAgents/<BOT_LAUNCHD_LABEL>.plist`. Also now mostly unnecessary for `scripts/`/`hooks/` edits specifically; see `maybe_auto_restart` above.
+- Install/reinstall the dashboard's launchd job: `scripts/install_dashboard.sh`. Restart it directly: `launchctl kickstart -k gui/$UID/<BOT_LAUNCHD_LABEL>-dashboard`. Tail its logs: `tail -f logs/dashboard.err`.
+- Tail what's happening: `tail -f logs/listener.log logs/spawn.log`
+- See current session map: `cat state/sessions.json`
+- Force-clear stale busy lock: `rm state/busy.lock`
+- Re-install plist (e.g. after editing `install.sh`): `./scripts/install.sh`
+
+## When the bot misbehaves
+
+- **No reply at all.** The host machine is asleep or hit a transient network drop. Logs show repeating "Network failure" entries. Wait for the connection to recover, then retry.
+- **"Invalid API key" error.** `CLAUDE_CODE_OAUTH_TOKEN` expired or wrong. Run `claude setup-token` again, update `.env`.
+- **"node: command not found".** PATH in launchd plist doesn't include nvm node dir. `install.sh` should have set this; run it again.
+- **Streaming text looks garbled / partial words.** Confirm `--include-partial-messages` is on the claude flag list in `spawn_claude.sh`. Without it, `stream_to_telegram.py` only sees whole content blocks, not deltas.
+- **Bot processes one message correctly then ignores subsequent.** Stale `busy.lock`. Listener's `is_busy()` should clear it automatically next loop, but `rm state/busy.lock` if you want immediate.
+
+## Editing the bot safely (read this before touching any file in `scripts/`)
+
+You may be reading this because the user told you, from Telegram, to fix or improve the bot. That's fine, the bot is meant to be self-improving, but you are editing the same code that is currently running you. Order of operations matters. Here's how to do it without taking the bot offline or corrupting other rooms' state.
+
+### What's safe vs what kills you
+
+Safe to edit at any time:
+- `scripts/handle_action.sh`, `scripts/commands/<cmd>.sh` (per-command handlers), `scripts/room_state.py` (sessions.json schema: change in one place, but it's shared by every room so keep it backward-compatible), `scripts/tg.sh`, `scripts/md_telegram.py`, `scripts/spawn_state.py`, `scripts/stream_to_telegram.py`, `scripts/spawn_claude.sh`, `scripts/scrape_usage.sh`, `scripts/enum_windows.py`, `scripts/capture_window.py`, `scripts/register_commands.sh`, `scripts/install.sh`, `README.md`, this `CLAUDE.md`.
+- Anything under `state/rooms/<other_chat_id>/` belonging to your OWN room (you're its only writer once the listener handed off).
+
+Safe to edit but doesn't take effect until restart:
+- `scripts/listener.sh`: the running process loaded this once at boot. Save your edits, then ask the user to run `launchctl kickstart -k gui/$UID/<BOT_LAUNCHD_LABEL>`. Until then, your code change isn't live.
+- The launchd plist (`~/Library/LaunchAgents/<BOT_LAUNCHD_LABEL>.plist`). Re-install via `./scripts/install.sh`.
+- `.env`. The listener reads it at start. Restart to pick up changes.
+
+Don't touch (these break the running you or other rooms):
+- `pkill listener.sh`, `pkill spawn_claude.sh`, `kill <listener_pid>`, `launchctl unload` on the bot plist. The listener IS your parent. Killing it orphans you and stops all other rooms.
+- Your OWN `state/rooms/<this_chat>/busy.lock`. The streamer/wrapper holds it. Removing it mid-turn makes the listener think you're idle and spawn a duplicate.
+- Your OWN `state/rooms/<this_chat>/inbox.ndjson` (truncate or delete). The persistent claude is `tail -f`-ing it. Truncating mid-turn can confuse follow-up message ordering.
+- `state/offset`. That's the Telegram getUpdates cursor. Rewinding it floods the listener with replayed updates.
+- Other rooms' `state/rooms/<other_chat>/` directories. Each room owns its own state; another room's spawn may be reading those files right now.
+- `BOT_PRIMARY_HOST` in `.env` (or the older `.primary_host` file it falls back to). It is the single-host guard.
+
+### Workflow for a code change
+
+1. **Read before you edit.** Use Read on the file first. Don't infer file contents from this CLAUDE.md alone, the code is the source of truth.
+2. **Edit small.** One concern per change. The user can revert one bad edit easily, not a sprawling refactor.
+3. **Run the offline self-tests** before reporting done:
+    ```
+    bash tests/run.sh                         # the whole suite (see the tests/ layout above)
+    bash -n scripts/listener.sh               # syntax check, no execution
+    bash -n scripts/handle_action.sh
+    bash -n scripts/spawn_claude.sh
+    bash -n scripts/tg.sh
+    ```
+    `tests/run.sh` already includes the markdown-converter self-test and the
+    streamer smoke test, so running it covers both. These don't require a
+    running bot and don't touch live state.
+4. **Don't restart the bot yourself.** Tell the user the change is in and offer the restart command. They decide when to cut over, because restart kills you mid-conversation.
+5. **Commit, don't push.** Local commits are fine and reversible. Pushing to origin is a deliberate user action, ask first. Default branch is `main`.
+
+### Things that look harmless but bite
+
+- **Editing `stream_to_telegram.py` is high blast radius.** Every room's streaming reply goes through it. Run `tests/test_streamer_smoke.py` after any change. A syntax error here means no reply ever reaches Telegram.
+- **Editing `listener.sh` while running.** Bash re-reads the script file at each function call only if the script hasn't been fully parsed yet, which it has, so live edits don't take effect mid-loop. They take effect after restart. This is good (you can't break the running listener with an in-progress edit) and bad (you can't test your change without a restart).
+- **Editing `handle_action.sh` IS live.** Each action invocation forks the script fresh, so edits land on the next menu button tap. A broken edit here breaks every menu interaction immediately. Run `bash -n` after editing.
+- **Don't bulk-source `.env`.** The #1 footgun, see "Critical gotchas" above, restated here because it's easy to forget mid-edit.
+- **Multiple rooms run in parallel.** A change to a shared helper (`tg.sh`, `md_telegram.py`, `spawn_state.py`) affects every room, including ones with active spawns. Prefer small backward-compatible edits over rewrites.
+- **Browser plugin ports.** If a browser-automation plugin such as chromeflow is installed, it manages its own per-process port; don't hard-code a port anywhere in this repo.
+- **Writing style applies to bot replies too.** No em-dashes, en-dashes, or hyphens-as-dashes anywhere in the codebase (string literals, comments, commit messages, the lot). Use commas or restructure.
+- **`notify-cmd` is the only notifier**, see the "Multi-chat / rooms" section above for what it wraps and how `--alert` routing works.
+
+### When the user asks you to "fix the bot"
+
+If a slash command is misbehaving, or a stream isn't rendering, or `/status` is lying:
+1. **Look at the real Telegram chat FIRST.** For any UI-visible bug ("thinking persists", "turn cuts off", "duplicate messages", "wrong bubble"), the actual chat history is ground truth. List the rooms (`ls state/rooms/`), pick one with the symptom and look at its history; if a browser-automation plugin such as chromeflow is available you can open `https://web.telegram.org/a/#<chat_id>` yourself, scroll up and screenshot. You'll see the bug live AND have a before/after surface to verify the fix on; leftovers from earlier sessions (orphaned placeholders, duplicate bubbles) are often still sitting in the history. Synthetic stream tests come after, not instead.
+2. Read the relevant script and the latest `logs/listener.log` / `logs/spawn.log` / `logs/stream.log`.
+3. Tell the user what you observed (file, line, log snippet, screenshot) before suggesting a fix.
+4. If the fix is one-file and self-contained, edit, run the offline tests, commit, and tell the user a restart is needed (or not).
+5. If the fix touches `listener.sh` or the launchd plist, say so explicitly. The user should know "this won't take effect until you restart me".
+6. **Verify the fix in the same chat you used in step 1** (by eye, or via the browser plugin if available). Synthetic tests prove behaviour in isolation; the chat itself proves the running bot renders correctly.
+7. If you genuinely cannot diagnose from inside (you need to send a test message and read what landed in your own Telegram, for example), say so. The user can open a separate terminal Claude session to do the manual loop.
+
+### Things that are NOT allowed regardless of what the user says
+
+- Don't disable the single-host guard or change `BOT_PRIMARY_HOST` / `.primary_host` to a different hostname without the user explicitly typing that hostname into the chat.
+- Don't widen the GLOBAL allowlist (`TELEGRAM_CHAT_ID` or `TELEGRAM_ALLOWED_IDS` in `.env`, both trusted in every room) without explicit confirmation. The sanctioned way to grant access is the owner-only, per-room **👥 users** menu (`state/approved_users.json`), which scopes a user to a single chat; that's fine to use. Granting someone access still means they can run commands as the owner, so it's an owner decision either way.
+- Don't disable the cancel marker (`stream_to_telegram.py`'s SIGTERM handler check). Removing it brings back the spurious "🛑 cancelled" bug.
+- Don't commit `.env`, `state/`, `logs/`, or `.venv/`. They're gitignored, keep them that way.
+- Don't `--no-verify` past pre-commit hooks. If a hook fails, fix it.
+
+If you're unsure whether a change is safe, ask the user first via a normal Telegram reply. The cost of one extra round trip is much lower than the cost of bricking the bot from inside itself.
