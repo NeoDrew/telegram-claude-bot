@@ -112,6 +112,9 @@ them with comments:
 - **`BOT_DASHBOARD_PORT`:** the local metrics dashboard port. Default 8787.
 - **`RL_ALERT_DEDUP_S`:** how long one rate-limit alert suppresses
   duplicates from other chats hitting the same limit. Default 7200 seconds.
+- **`BOT_PRECOMPACT_PCT`:** context fill at which a new message is preceded
+  by a compression, so Claude compresses first and then answers. A chat's
+  own auto compact setting wins. Default 90.
 
 Fixed on purpose: files people send the bot are saved to `~/Downloads`, and
 per-chat state lives in `state/` inside the repo.

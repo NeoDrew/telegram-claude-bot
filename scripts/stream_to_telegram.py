@@ -1702,6 +1702,18 @@ def _recover_prompt_too_long(lines: list) -> bool:
     return True
 
 
+def _record_ctx(ev: dict):
+    """Leave the context fill for listener.sh's context_full, which
+    compresses BEFORE delivering the next message once it is high."""
+    pct = ctx_pct_from_result(ev)
+    if pct is None:
+        return
+    try:
+        _room_path(".ctx_pct").write_text(f"{pct:.0f}")
+    except Exception:
+        pass
+
+
 def _compacting_marker(on: bool):
     try:
         p = _room_path(".compacting")
@@ -1745,6 +1757,7 @@ def _on_system(ev: dict):
         _compact_mid = None
         _compact_started = 0.0
         _compact_announced = True
+        _room_path(".ctx_pct").unlink(missing_ok=True)
         _compacting_marker(False)
         _ptl_compact_queued = False
 
@@ -2613,6 +2626,7 @@ def main():
                 _is_interrupt = (ev.get("subtype") == "error_during_execution"
                                  and _room_path(".interrupt_requested").exists())
                 _answered = _close_turn(ev)
+                _record_ctx(ev)
                 if not ev.get("is_error") or _is_interrupt:
                     # Every inbox line this turn read, mid-turn ones
                     # included, is now answered: flip their queued 🫡/😴/👀

@@ -53,6 +53,9 @@ def main():
     os.makedirs(room, exist_ok=True)
     marker = os.path.join(room, ".compact_in_flight")
     open(marker, "w").close()
+    ctx_file = os.path.join(room, ".ctx_pct")
+    with open(ctx_file, "w") as f:
+        f.write("97")
 
     notified = []
     subprocess.run = lambda args, **kw: notified.append(list(args))
@@ -129,6 +132,12 @@ def main():
         failures.append("notify-cmd confirmation duplicated the bubble")
     else:
         print("ok: no duplicate notify-cmd confirmation")
+
+    if os.path.exists(ctx_file):
+        os.remove(ctx_file)
+        failures.append(".ctx_pct survived the compaction (the next message would compact again)")
+    else:
+        print("ok: compaction clears the context reading")
 
     if os.path.exists(marker):
         os.remove(marker)

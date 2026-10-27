@@ -51,6 +51,11 @@ room_dir() {
 # covers how tightly Telegram's own split-message delivery clusters
 # while staying short enough not to read as added latency.
 DEBOUNCE_WINDOW_S="$(bot_config BOT_DEBOUNCE_WINDOW_S 2)"
+# Context fill (%) at which a new message is preceded by /compact, so the
+# user sees: message, compression, answer. A room's own auto compact
+# setting wins. Claude Code's own trigger sits near the very top of the
+# window and can reject the message instead ("Prompt is too long").
+PRECOMPACT_PCT="$(bot_config BOT_PRECOMPACT_PCT 90)"
 
 TELEGRAM_BOT_TOKEN=$(extract_var TELEGRAM_BOT_TOKEN)
 TELEGRAM_CHAT_ID=$(extract_var TELEGRAM_CHAT_ID)
@@ -337,6 +342,10 @@ start_spawn() {
     # BEFORE the user message so the context is compressed first. Coalescing
     # /compact as plain text into the user message (the old queue approach)
     # caused it to be treated as message content rather than a slash command.
+    if context_full "$chat_id"; then
+      log "  context full chat=$chat_id: compressing before the message"
+      touch "$rd/.compact_pending"
+    fi
     if [[ -f "$rd/.compact_pending" ]]; then
       rm -f "$rd/.compact_pending"
       inject_to_inbox "/compact" "$chat_id"   # synthetic, no message to react to
@@ -602,6 +611,10 @@ drain_inject_burst() {
     if is_busy "$chat_id" && [[ -f "$rd/.inbox_ready" ]]; then
       log "  inject-debounce flush chat=$chat_id: ${count} message(s) coalesced into inbox"
       emit_metric dequeue room="$chat_id" count="$count"
+      if context_full "$chat_id"; then
+        log "  context full chat=$chat_id: compressing before the message"
+        inject_to_inbox "/compact" "$chat_id"
+      fi
       inject_to_inbox "$combined" "$chat_id"
     else
       # The spawn this burst was waiting on died or tore down mid-window
@@ -697,6 +710,22 @@ print(classify(Path(os.environ['ROOM_DIR'])).get('state', ''))
 # stale entry that misattributes a later turn's reaction to the wrong
 # message, it just degrades to "reaction never updates" for that one
 # message, exactly today's behaviour, never a wrong-message update.
+# context_full <chat_id>: true when the room's last turn left the context at
+# or above its compaction threshold (the room's autocompact setting, else
+# PRECOMPACT_PCT). Consumes the reading, so one burst compacts once. Only
+# called where Claude is between turns: mid-turn, Claude Code compacts by
+# itself between tool calls.
+context_full() {
+  local rd="$ROOMS_DIR/$1" pct limit
+  [[ -f "$rd/.ctx_pct" ]] || return 1
+  pct=$(tr -dc '0-9' < "$rd/.ctx_pct")
+  limit=$(tr -dc '0-9' < "$rd/autocompact" 2>/dev/null)
+  [[ -n "$limit" ]] || limit="$PRECOMPACT_PCT"
+  [[ -n "$pct" ]] && (( pct >= limit )) || return 1
+  rm -f "$rd/.ctx_pct"
+  return 0
+}
+
 inject_to_inbox() {
   local text="$1"
   local chat_id="$2"
