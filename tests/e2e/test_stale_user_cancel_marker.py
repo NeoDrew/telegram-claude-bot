@@ -50,9 +50,9 @@ def case_real_cancel_does_not_leak_marker():
             "sendMessage",
             lambda p: "sleep 999" in p.get("text", ""), timeout=20)
 
-        # act:cancel yes -> kill_room_spawn(paint_cancel=1) touches
+        # act:cancel force -> kill_room_spawn(paint_cancel=1) touches
         # .user_cancel, sends SIGTERM, the wrapper's cleanup() trap fires.
-        h.inject_callback_query("act:cancel yes", chat_id=DM_CHAT_ID)
+        h.inject_callback_query("act:cancel force", chat_id=DM_CHAT_ID)
         h.wait_for_call(
             "editMessageText",
             lambda p: "cancelled" in p.get("text", "").lower(), timeout=15)

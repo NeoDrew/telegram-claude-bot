@@ -11,6 +11,7 @@ transcript and classifies the real state:
     streaming:         claude is currently emitting text/tool_use
     tool:              claude emitted a tool_use, no matching tool_result yet
     awaiting_result:   tool_result just arrived, claude hasn't responded yet
+    compacting:        the streamer saw a context compaction start (.compacting)
     no_session:        spawn alive but no transcript at the expected path
     no_spawn:          no spawn process at all
 
@@ -196,6 +197,12 @@ def classify(room_state_dir: Path) -> dict:
     if not sid:
         if result["wrapper_pid_alive"]:
             result["state"] = "no_session"
+        return result
+
+    # The streamer marks a compaction in progress: Claude reads nothing
+    # until it finishes (often minutes), so this is not "idle".
+    if result["wrapper_pid_alive"] and (room_state_dir / ".compacting").exists():
+        result["state"] = "compacting"
         return result
 
     tx = find_transcript(sid)

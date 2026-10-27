@@ -196,6 +196,34 @@ assert_contains "label acks rename"       "$OUT" "My Room"
 run "cancel"
 assert_contains "cancel idle says nothing to cancel" "$(tg_calls)" "Nothing in flight to cancel"
 
+# A live spawn with an inbox: cancel interrupts the turn (a stream-json
+# control request), it does not kill anything or clear the queue.
+mkdir -p "$ROOM"
+sleep 60 & FAKE_SPAWN=$!
+echo "$FAKE_SPAWN" > "$ROOM/busy.lock"
+touch "$ROOM/.inbox_ready"
+printf '%s\n' '{"type":"user","message":{"role":"user","content":"the cut-short job"}}' \
+  '{"type":"user","message":{"role":"user","content":"queued msg"}}' > "$ROOM/inbox.ndjson"
+printf '[41]\n[42]\n' > "$ROOM/.pending_reacts"
+echo 'kept in queue' > "$ROOM/queue.jsonl"
+run "cancel"
+assert_contains "cancel live spawn interrupts" "$(tg_calls)" "Interrupting"
+assert_contains "interrupt is a control request" "$(tail -1 "$ROOM/inbox.ndjson")" '"subtype":"interrupt"'
+assert_eq "interrupt keeps reacts parallel" "$(tail -1 "$ROOM/.pending_reacts")" "[]"
+assert_eq "interrupt leaves the spawn running" "$(kill -0 "$FAKE_SPAWN" 2>/dev/null && echo alive)" "alive"
+assert_file_eq "interrupt keeps the queue" "$ROOM/queue.jsonl" "kept in queue"
+
+# The interrupt went unanswered: the next tap force-stops, and the line
+# Claude never read moves to the queue instead of being thrown away.
+touch -t 202001010000 "$ROOM/.interrupt_requested"
+run "cancel"
+assert_contains "stuck interrupt force-stops" "$(tg_calls)" "force stopped"
+sleep 0.2
+assert_eq "force stop kills the spawn" "$(kill -0 "$FAKE_SPAWN" 2>/dev/null && echo alive || echo gone)" "gone"
+assert_eq "force stop requeues the unread message" "$(tail -1 "$ROOM/queue.jsonl")" "queued msg"
+assert_eq "force stop keeps what was queued" "$(head -1 "$ROOM/queue.jsonl")" "kept in queue"
+rm -f "$ROOM/queue.jsonl" "$ROOM/.inbox_ready"
+
 # ---- close (menu collapse, not delete) -----------------------------------
 # Used to tg.sh delete the message; now collapses it to a single "☰ Menu"
 # button in place, same affordance as the turn-end footer's Menu shortcut.

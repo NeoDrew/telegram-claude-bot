@@ -19,10 +19,10 @@ Cases:
   4. Menu actions are NOT gated by room busy state (unlike plain text
      messages): tapping act:effort while a spawn is genuinely mid-turn
      must still persist immediately, not queue or get ignored.
-  5. A bare "act:cancel" tap (no "yes") kills an in-flight spawn
-     IMMEDIATELY, with no confirmation step, matching the documented
-     one-tap behaviour of the `cancel` action (CLAUDE.md's action
-     reference). Any arguments are ignored.
+  5. A bare "act:cancel" tap interrupts an in-flight turn IMMEDIATELY,
+     with no confirmation step, like Esc in Claude Code: the spawn stays
+     up, the chat says "Interrupted", and a message sent during the stuck
+     turn is answered next (CLAUDE.md's action reference).
 
 Run: python3 tests/e2e/test_menu_combinations.py
 """
@@ -213,7 +213,8 @@ def case_bare_cancel_has_no_confirm_step():
     h = E2EHarness(label="menu-combo-cancel-noconfirm")
     fd, script_path = tempfile.mkstemp(suffix=".json", prefix="fake-claude-script-")
     os.close(fd)
-    write_fake_claude_script(script_path, [{"hang": True}])
+    write_fake_claude_script(script_path, [
+        {"hang": True}, {"text": "answer to the queued message"}])
     try:
         h.setup(fake_claude_script=script_path,
                 extra_env={"BOT_DRAFT_STREAMING": "0"})
@@ -225,20 +226,26 @@ def case_bare_cancel_has_no_confirm_step():
         busy_lock = os.path.join(h.room_dir(DM_CHAT_ID), "busy.lock")
         assert os.path.exists(busy_lock)
 
-        # Cancel is one tap, no confirm step: bare "act:cancel" (no
-        # "yes") must kill immediately, exactly like "act:cancel yes".
-        # A regression toward silently requiring confirmation shows up
-        # here.
-        h.inject_callback_query("act:cancel", chat_id=DM_CHAT_ID, message_id=2)
-
+        # Sent while the turn is stuck: it must be answered after the
+        # interrupt, not thrown away.
+        h.inject_dm("queued follow-up", message_id=3)
+        inbox = os.path.join(h.room_dir(DM_CHAT_ID), "inbox.ndjson")
         deadline = time.time() + 10
-        while time.time() < deadline and os.path.exists(busy_lock):
+        while time.time() < deadline and "queued follow-up" not in open(inbox).read():
             time.sleep(0.2)
-        assert not os.path.exists(busy_lock), (
-            "bare act:cancel (no 'yes') did not kill the spawn, but "
-            "cancel is documented as one tap with no confirm step")
-        print("ok: bare act:cancel kills immediately, no confirm step "
-              "(matches the documented one-tap cancel)")
+
+        # Cancel is one tap, no confirm step.
+        h.inject_callback_query("act:cancel", chat_id=DM_CHAT_ID, message_id=2)
+        h.wait_for_call("sendMessage",
+                         lambda p: "Interrupted" in p.get("text", ""), timeout=15)
+        print("ok: bare act:cancel interrupts immediately, no confirm step")
+        h.wait_for_call(
+            "editMessageText",
+            lambda p: "answer to the queued message" in p.get("text", ""),
+            timeout=20)
+        assert os.path.exists(busy_lock), "the interrupt should not kill the spawn"
+        print("ok: the message sent during the stuck turn is answered next, "
+              "same spawn")
         return True
     except Exception:
         import traceback

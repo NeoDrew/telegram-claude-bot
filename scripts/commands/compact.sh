@@ -5,6 +5,7 @@
     INBOX="$ROOM_DIR/inbox.ndjson"
     if [[ -f "$ROOM_DIR/.inbox_ready" ]]; then
       printf '{"type":"user","message":{"role":"user","content":"/compact"}}\n' >> "$INBOX"
+      echo '[]' >> "$ROOM_DIR/.pending_reacts"   # keep 1:1 with the inbox
       touch "$ROOM_DIR/.compact_in_flight"
       echo "🗜 Compressing context."
     elif is_busy "$ROOM_CHAT_ID"; then

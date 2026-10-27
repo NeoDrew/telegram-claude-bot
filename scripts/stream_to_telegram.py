@@ -1523,6 +1523,232 @@ signal.signal(signal.SIGTERM, _cancel_handler)
 signal.signal(signal.SIGINT, _cancel_handler)
 
 
+# ── Inbox read tracking ────────────────────────────────────────────────────
+# spawn_claude.sh passes --replay-user-messages, so Claude Code echoes every
+# inbox line back (a "user" event with isReplay) the moment it reads it,
+# including lines it folds into a turn that is already running. Matching
+# those echoes against inbox.ndjson tells us exactly which lines have been
+# read, so reactions and the crash salvage no longer assume "one inbox line
+# per result" (false since Claude Code started reading stdin mid-turn: a
+# message sent mid-turn was folded in and answered, but its reaction stayed
+# 🫡 because the next result popped the wrong .pending_reacts entry).
+# .pending_reacts stays line-for-line parallel with inbox.ndjson (see
+# listener.sh's inject_to_inbox); it is indexed, never popped.
+_inbox_cursor = 0                  # inbox lines read so far this spawn
+_turn_lines: list = []             # inbox line indexes read this turn
+_replay_seen = False               # has this claude ever echoed a line?
+_ptl_compact_queued = False        # recovery /compact appended, not yet run
+_ptl_retried: set = set()          # contents already retried once
+_compact_mid = None                # "🗜 Compressing context…" bubble
+_compact_started = 0.0
+_in_turn = False
+_compact_announced = False         # bubble showed "Context compressed"
+
+PTL_MARKERS = ("prompt is too long", "prompt too long", "context length")
+
+
+def _room_path(name: str) -> Path:
+    return REPO / "state" / "rooms" / str(TELEGRAM_CHAT_ID) / name
+
+
+def _norm_content(content) -> str:
+    return json.dumps(content, sort_keys=True, ensure_ascii=False)
+
+
+def _inbox_entries() -> list:
+    """inbox.ndjson as parsed dicts, one per line ({} for unparseable)."""
+    try:
+        raw = _room_path("inbox.ndjson").read_text().splitlines()
+    except Exception:
+        return []
+    out = []
+    for line in raw:
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+            out.append(obj if isinstance(obj, dict) else {})
+        except Exception:
+            out.append({})
+    return out
+
+
+def _entry_content(obj: dict):
+    return (obj.get("message") or {}).get("content")
+
+
+def _is_user_entry(obj: dict) -> bool:
+    return obj.get("type") == "user"
+
+
+def _pending_ids(idx: int) -> list:
+    try:
+        lines = [l for l in _room_path(".pending_reacts").read_text().splitlines() if l.strip()]
+        ids = json.loads(lines[idx]) if idx < len(lines) else []
+        return [i for i in ids if isinstance(i, int)]
+    except Exception:
+        return []
+
+
+def _react(ids, emoji: str):
+    for mid in ids:
+        try:
+            tg_api("setMessageReaction", {
+                "chat_id": str(TELEGRAM_CHAT_ID),
+                "message_id": str(mid),
+                "reaction": json.dumps([{"type": "emoji", "emoji": emoji}]),
+            })
+        except Exception:
+            pass
+
+
+def _write_read_count():
+    """Lines fully handled, for spawn_claude.sh's crash salvage."""
+    try:
+        _room_path(".turns_done").write_text(str(_inbox_cursor))
+    except Exception:
+        pass
+
+
+def _note_replay(content) -> bool:
+    """Claude just read an inbox line: find it at or after the cursor.
+    Lines it passes over (control requests, an unechoed /compact) count as
+    read too. Echoes that match no line (the compaction summary, local
+    command output) are ignored."""
+    global _inbox_cursor, _replay_seen, _in_turn
+    want = _norm_content(content)
+    entries = _inbox_entries()
+    for i in range(_inbox_cursor, len(entries)):
+        if _is_user_entry(entries[i]) and _norm_content(_entry_content(entries[i])) == want:
+            _replay_seen = True
+            _in_turn = True
+            new = list(range(_inbox_cursor, i + 1))
+            _turn_lines.extend(new)
+            _inbox_cursor = i + 1
+            try:   # commands/cancel.sh's force-stop keeps lines after this
+                _room_path(".inbox_read").write_text(str(_inbox_cursor))
+            except Exception:
+                pass
+            ids = [m for n in new for m in _pending_ids(n)]
+            _react(ids, "👀")          # read by Claude, answer on its way
+            return True
+    return False
+
+
+def _mark_in_turn():
+    global _in_turn
+    _in_turn = True
+
+
+def _close_turn(ev: dict) -> list:
+    """Return the inbox line indexes this result answered, advancing the
+    cursor when no echo was seen (older Claude Code, the e2e fake, or a
+    /compact line, which is never echoed)."""
+    global _inbox_cursor, _in_turn
+    _in_turn = False
+    lines = list(_turn_lines)
+    _turn_lines.clear()
+    if lines:
+        return lines
+    entries = _inbox_entries()
+    # Step over control lines (interrupt requests) at the cursor.
+    while _inbox_cursor < len(entries) and not _is_user_entry(entries[_inbox_cursor]):
+        _inbox_cursor += 1
+    if _inbox_cursor >= len(entries):
+        return []
+    at_cursor = _entry_content(entries[_inbox_cursor])
+    if (not _replay_seen and not ev.get("is_error")) or at_cursor == "/compact":
+        _inbox_cursor += 1
+        return [_inbox_cursor - 1]
+    if ev.get("is_error") and any(k in str(ev.get("result") or "").lower() for k in PTL_MARKERS):
+        # Rejected before Claude echoed it: the failed message is the next line.
+        _inbox_cursor += 1
+        return [_inbox_cursor - 1]
+    return []
+
+
+def _append_inbox(content, ids):
+    """Append one user line to the inbox with its parallel reacts line."""
+    with open(_room_path("inbox.ndjson"), "a") as f:
+        f.write(json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n")
+    with open(_room_path(".pending_reacts"), "a") as f:
+        f.write(json.dumps(list(ids)) + "\n")
+
+
+def _recover_prompt_too_long(lines: list) -> bool:
+    """The context was too full to take this message. Queue /compact and
+    then the same message(s) again, once. Returns False when the message
+    was already retried (it is too big even after compressing)."""
+    global _ptl_compact_queued
+    entries = _inbox_entries()
+    retry = []
+    for i in lines:
+        if i < len(entries) and _is_user_entry(entries[i]):
+            c = _entry_content(entries[i])
+            if c != "/compact":
+                retry.append((c, _pending_ids(i)))
+    if any(_norm_content(c) in _ptl_retried for c, _ in retry):
+        return False
+    try:
+        if not _ptl_compact_queued:
+            _append_inbox("/compact", [])
+            _ptl_compact_queued = True
+        for c, ids in retry:
+            _ptl_retried.add(_norm_content(c))
+            _append_inbox(c, ids)
+    except Exception as e:
+        log(f"prompt-too-long recovery failed: {e}")
+        return False
+    return True
+
+
+def _compacting_marker(on: bool):
+    try:
+        p = _room_path(".compacting")
+        if on:
+            p.touch()
+        else:
+            p.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _on_system(ev: dict):
+    """Show compaction as it happens: Claude Code can spend minutes
+    summarising, during which nothing else streams and new messages sit
+    unanswered, so without this the chat just looks dead."""
+    global _compact_mid, _compact_started, _ptl_compact_queued, _compact_announced
+    sub = ev.get("subtype")
+    if sub == "status" and ev.get("status") == "compacting":
+        if _compact_mid is None:
+            _compact_started = time.monotonic()
+            _compacting_marker(True)
+            _compact_mid = tg_send("🗜 _Compressing context, messages you send now will be answered once it finishes…_") or 0
+    elif sub == "status" and ev.get("compact_result"):
+        ok = ev.get("compact_result") == "success"
+        if not ok and _compact_mid:
+            tg_edit(_compact_mid, "⚠️ Context compression failed.")
+        if not ok:
+            _compact_mid = None
+            _compacting_marker(False)
+            _ptl_compact_queued = False
+    elif sub == "compact_boundary":
+        meta = ev.get("compact_metadata") or {}
+        pre, post = meta.get("pre_tokens"), meta.get("post_tokens")
+        secs = int(time.monotonic() - _compact_started) if _compact_started else 0
+        sizes = f": {pre // 1000}k → {post // 1000}k tokens" if pre and post else ""
+        text = f"🗜 Context compressed{sizes} in {fmt_duration(secs * 1000)}."
+        if _compact_mid:
+            tg_edit(_compact_mid, text)
+        elif _compact_mid is None:
+            tg_send(text)
+        _compact_mid = None
+        _compact_started = 0.0
+        _compact_announced = True
+        _compacting_marker(False)
+        _ptl_compact_queued = False
+
+
 def main():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         sys.stderr.write("stream_to_telegram: missing TELEGRAM_BOT_TOKEN/CHAT_ID\n")
@@ -2018,6 +2244,8 @@ def main():
 
             if evtype == "stream_event":
                 inner = ev.get("event") or {}
+                if inner.get("type") == "message_start":
+                    _mark_in_turn()
                 itype = inner.get("type")
 
                 if itype == "message_start":
@@ -2327,6 +2555,10 @@ def main():
                 # tool returned without the full text being in the chat.
                 msg = ev.get("message") or {}
                 content = msg.get("content")
+                if ev.get("isReplay"):
+                    # An inbox line Claude just read (see _note_replay).
+                    _note_replay(content)
+                    continue
                 # Not always a block list: after a /compact, Claude Code sends
                 # the conversation summary (and "Compacted") as a user message
                 # whose content is a plain string. Iterating that walked it
@@ -2378,47 +2610,21 @@ def main():
                 # defined regardless of which side of is_error this turn
                 # took, not just inside the not-is_error path.
                 _this_turn_was_compact = False
+                _is_interrupt = (ev.get("subtype") == "error_during_execution"
+                                 and _room_path(".interrupt_requested").exists())
+                _answered = _close_turn(ev)
+                if not ev.get("is_error") or _is_interrupt:
+                    # Every inbox line this turn read, mid-turn ones
+                    # included, is now answered: flip their queued 🫡/😴/👀
+                    # reactions to 👍 (✅ is NOT in Telegram's curated
+                    # reaction set; it 400s with REACTION_INVALID).
+                    _react([m for n in _answered for m in _pending_ids(n)], "👍")
+                    _write_read_count()
+                # Any other error (rate limit, a too-full context) leaves
+                # .turns_done short of these lines, so the crash salvage
+                # re-queues them; the prompt-too-long recovery below
+                # re-sends them itself.
                 if not ev.get("is_error"):
-                    try:
-                        _td = (REPO / "state" / "rooms"
-                               / str(TELEGRAM_CHAT_ID) / ".turns_done")
-                        _cur = int(_td.read_text().strip() or 0) if _td.exists() else 0
-                        _td.write_text(str(_cur + 1))
-                    except Exception:
-                        pass
-                    # Pop this turn's .pending_reacts entry (pushed by
-                    # listener.sh's inject_to_inbox, one line per inbox
-                    # line, see its docstring) and flip whichever Telegram
-                    # messages it names from their "queued" 🫡/😴 reaction to
-                    # 👍, now that Claude has actually answered them. Kept in
-                    # the same not-is_error branch as the .turns_done bump
-                    # above deliberately: an errored turn doesn't consume
-                    # its inbox line either (it's retried), so the two
-                    # counters must move together or they desync.
-                    #
-                    # This previously used ✅ (WHITE HEAVY CHECK MARK),
-                    # which is NOT in Telegram's fixed curated set of valid
-                    # message-reaction emoji, so every call failed with
-                    # "400 REACTION_INVALID" (visible in logs/stream.log),
-                    # silently swallowed by this function's own except:
-                    # pass. 👍 is in the standard set (same set 🫡/😴/👀
-                    # already draw from successfully elsewhere in this file).
-                    try:
-                        _pr = (REPO / "state" / "rooms"
-                               / str(TELEGRAM_CHAT_ID) / ".pending_reacts")
-                        if _pr.exists():
-                            _lines = _pr.read_text().splitlines()
-                            if _lines:
-                                _ids = json.loads(_lines[0])
-                                _pr.write_text("\n".join(_lines[1:]) + ("\n" if len(_lines) > 1 else ""))
-                                for _mid in _ids:
-                                    tg_api("setMessageReaction", {
-                                        "chat_id": str(TELEGRAM_CHAT_ID),
-                                        "message_id": str(_mid),
-                                        "reaction": json.dumps([{"type": "emoji", "emoji": "👍"}]),
-                                    })
-                    except Exception:
-                        pass
                     # Compact-in-flight: if a /compact was injected via the
                     # menu button, fire a notify-cmd confirmation so the user
                     # gets an explicit alert that compression completed.
@@ -2428,11 +2634,14 @@ def main():
                         if _cif.exists():
                             _cif.unlink()
                             _this_turn_was_compact = True
-                            import subprocess as _sp, os as _os
-                            _nc = bot_config.notify_cmd()
-                            _sp.run([_nc, "--tag", "[compact]",
-                                     "Context compressed."],
-                                    capture_output=True, timeout=5)
+                            # Skipped when the progress bubble (_on_system)
+                            # already said "Context compressed".
+                            if not _compact_announced:
+                                import subprocess as _sp
+                                _nc = bot_config.notify_cmd()
+                                _sp.run([_nc, "--tag", "[compact]",
+                                         "Context compressed."],
+                                        capture_output=True, timeout=5)
                     except Exception:
                         pass
                 if _parse_entity_errs > 0:
@@ -2454,8 +2663,30 @@ def main():
                     if final:
                         tg_send(final)
                 # If claude reported an error, surface it.
-                if ev.get("is_error"):
-                    raw_err = str(ev.get("api_error_status") or ev.get("subtype") or ev.get("result") or "error")
+                _err_text = str(ev.get("result") or "")
+                if _is_interrupt:
+                    # The 🛑 cancel button interrupted this turn (see
+                    # commands/cancel.sh); Claude moves on to the next inbox
+                    # line by itself, so there is no error to report.
+                    _room_path(".interrupt_requested").unlink(missing_ok=True)
+                    tg_send("🛑 _Interrupted._")
+                elif (ev.get("is_error")
+                        and any(k in _err_text.lower() for k in PTL_MARKERS)):
+                    # The context was too full to take the message. Claude
+                    # Code does not compact first in this case, so queue a
+                    # /compact and re-send the message after it.
+                    if _recover_prompt_too_long(_answered):
+                        tg_send("🗜 _Context is full. Compressing it now, then I'll answer your message._")
+                    else:
+                        tg_send("⚠️ That message doesn't fit in the context even after compressing. Try a shorter one, or start a new session from the menu.")
+                elif ev.get("is_error"):
+                    # The result text first: "subtype" is "success" even on
+                    # many error results, which used to surface as the
+                    # meaningless "⚠️ claude error: success".
+                    _sub = ev.get("subtype")
+                    raw_err = str(ev.get("api_error_status") or _err_text
+                                  or (_sub if _sub != "success" else "")
+                                  or "error")
                     # Check the FULL result text for the auth-failure phrases
                     # BEFORE the generic-fallback decision below, not just
                     # raw_err's narrow priority order (api_error_status,
@@ -2623,7 +2854,17 @@ def main():
                     except Exception:
                         pass
 
-            # system / unknown: skip
+            elif evtype == "system":
+                _on_system(ev)
+
+            elif evtype == "control_response":
+                # An interrupt that arrived between turns ends nothing, so
+                # no result will clear its marker; clear it here instead so
+                # the next 🛑 tap is not mistaken for a stuck interrupt.
+                if not _in_turn:
+                    _room_path(".interrupt_requested").unlink(missing_ok=True)
+
+            # unknown: skip
 
     except Exception as e:
         log(f"main loop crashed: {e}")

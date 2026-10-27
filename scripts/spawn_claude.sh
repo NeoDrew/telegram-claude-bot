@@ -347,12 +347,16 @@ if [[ "${CLAUDE_SILENT_SPAWN:-}" != "1" ]]; then
     : > "$INBOX"
     : > "$ROOM_DIR/.pending_reacts"   # keep 1:1 with inbox, see listener.sh's inject_to_inbox
     write_user_ndjson "$USER_MSG" >> "$INBOX"
+    echo '[]' >> "$ROOM_DIR/.pending_reacts"
     touch "$INBOX_READY"
   fi
-  # Per-spawn turn counter (incremented by the streamer on each clean
-  # result envelope). The crash/rate-limit salvage skips this many inbox
-  # lines, so only messages whose turn never completed get re-queued.
+  # Per-spawn count of inbox lines fully answered (the streamer writes it
+  # on each clean result, from Claude's echoes of the lines it read). The
+  # crash/rate-limit salvage skips this many inbox lines, so only messages
+  # whose turn never completed get re-queued.
   echo 0 > "$ROOM_DIR/.turns_done"
+  # Markers that only mean something to a live claude process.
+  rm -f "$ROOM_DIR/.compacting" "$ROOM_DIR/.interrupt_requested" "$ROOM_DIR/.inbox_read"
   # We're running, so any rate-limit hold from a previous spawn is stale.
   rm -f "$ROOM_DIR/.rate_limited_until"
   # Clean up any stale ask_user state from a previous spawn so the listener
@@ -508,10 +512,12 @@ PYEOF
     CLAUDE_HOOKS_SUPPRESS_TELEGRAM=1 "$CLAUDE_BIN" \
       "${SESSION_ARGS[@]}" \
       --input-format=stream-json \
+      --replay-user-messages \
       "${CLAUDE_FLAGS[@]}" \
       "${MCP_FLAGS[@]}" \
       2>>"$LOG" | tee -a "$STREAM_LOG" | tee_to_log
   EXIT=${PIPESTATUS[1]}
+  rm -f "$ROOM_DIR/.compacting" "$ROOM_DIR/.interrupt_requested" "$ROOM_DIR/.inbox_read"
 
   # The inbox consumer is gone; route any further messages to the queue.
   rm -f "$INBOX_READY"

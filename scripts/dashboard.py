@@ -83,7 +83,7 @@ def _room_status(state_info: dict, rate_limited_until) -> str:
     if rate_limited_until and rate_limited_until > now:
         return "warning"
     state = state_info.get("state")
-    if state in ("tool", "streaming", "awaiting_result"):
+    if state in ("tool", "streaming", "awaiting_result", "compacting"):
         return "busy"
     if state == "idle":
         return "good"

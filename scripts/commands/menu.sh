@@ -81,7 +81,7 @@ try:
     _state = (json.loads(_sj) or {}).get("state", "no_spawn")
 except Exception:
     _state = "no_spawn"
-busy = _state in ("streaming", "tool", "awaiting_result")
+busy = _state in ("streaming", "tool", "awaiting_result", "compacting")
 
 # Pretty labels: show CURRENT values so the menu doubles as a status panel.
 # Config-rare actions (rooms, tab, schedule, label, verbosity, users, plugin

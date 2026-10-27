@@ -463,6 +463,7 @@ fire_scheduled_tasks() {
 import json, os
 print(json.dumps({'type': 'user', 'message': {'role': 'user', 'content': os.environ['USER_MSG_TEXT']}}))
 " >> "$inbox"
+        echo '[]' >> "$rd/.pending_reacts"   # keep 1:1 with the inbox, see inject_to_inbox
         log "  injected into active session inbox"
       else
         # Busy with no live inbox consumer (teardown window or a silent

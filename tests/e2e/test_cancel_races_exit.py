@@ -96,7 +96,7 @@ def case_cancel_races_rate_limit():
         # Fire the cancel as early as possible in the 1.5s window, the
         # most adversarial timing, maximising the chance the TERM actually
         # lands before the scripted rate-limit delay elapses.
-        h.inject_callback_query("act:cancel yes", chat_id=DM_CHAT_ID)
+        h.inject_callback_query("act:cancel force", chat_id=DM_CHAT_ID)
 
         # Give both sides of the race time to fully resolve (TERM+trap, or
         # the natural exit + fallthrough classification) before asserting.
@@ -165,7 +165,7 @@ def case_cancel_races_crash():
         sid_before = _wait_for_session_id(h)
         assert sid_before, "expected a session_id to exist before the race"
 
-        h.inject_callback_query("act:cancel yes", chat_id=DM_CHAT_ID)
+        h.inject_callback_query("act:cancel force", chat_id=DM_CHAT_ID)
 
         deadline = time.time() + 8
         while time.time() < deadline and os.path.exists(
@@ -235,8 +235,8 @@ def case_rapid_double_cancel():
         # Two taps back to back, the way an impatient real user actually
         # behaves (tap again because nothing visibly happened yet), not one
         # tap with a generous pause before the second.
-        h.inject_callback_query("act:cancel yes", chat_id=DM_CHAT_ID, cb_id="cb1")
-        h.inject_callback_query("act:cancel yes", chat_id=DM_CHAT_ID, cb_id="cb2")
+        h.inject_callback_query("act:cancel force", chat_id=DM_CHAT_ID, cb_id="cb1")
+        h.inject_callback_query("act:cancel force", chat_id=DM_CHAT_ID, cb_id="cb2")
 
         h.wait_for_call("editMessageText",
                          lambda p: "cancelled" in p.get("text", "").lower(),

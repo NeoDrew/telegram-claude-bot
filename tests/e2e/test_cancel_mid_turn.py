@@ -50,8 +50,9 @@ def main():
         busy_lock = os.path.join(h.room_dir(DM_CHAT_ID), "busy.lock")
         assert os.path.exists(busy_lock), "expected busy.lock while the hang turn is live"
 
-        # act:cancel yes, the confirmed form, skips the confirm prompt.
-        h.inject_callback_query("act:cancel yes", chat_id=DM_CHAT_ID)
+        # act:cancel force: the force stop (a plain tap interrupts instead, see
+        # test_menu_combinations.py), which SIGTERMs the whole spawn.
+        h.inject_callback_query("act:cancel force", chat_id=DM_CHAT_ID)
 
         h.wait_for_call(
             "editMessageText",

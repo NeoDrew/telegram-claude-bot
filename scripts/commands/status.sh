@@ -144,6 +144,8 @@ def render_state(st):
         return f"🔧 in tool: {tn} · {dur}"
     if s == 'awaiting_result':
         return "⏳ awaiting result"
+    if s == 'compacting':
+        return "🗜 compacting context"
     if s == 'no_session':
         return "⚪ no session"
     return "⚪ no spawn"

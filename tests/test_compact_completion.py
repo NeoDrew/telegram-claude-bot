@@ -71,9 +71,12 @@ def main():
             return self._b
 
     mid = [100]
+    calls = []
 
     def fake_urlopen(req, timeout=None):
+        import urllib.parse
         method = req.full_url.rsplit("/", 1)[-1]
+        calls.append((method, dict(urllib.parse.parse_qsl(req.data.decode() if req.data else ""))))
         if method == "sendMessage":
             mid[0] += 1
             return Resp(json.dumps({"ok": True, "result": {"message_id": mid[0]}}).encode())
@@ -109,10 +112,23 @@ def main():
     else:
         print("ok: string-content user messages after /compact don't crash the streamer")
 
-    if not any("Context compressed." in " ".join(a) for a in notified):
-        failures.append("the 'Context compressed.' confirmation was never sent")
+    # The progress bubble: sent when compaction starts, edited in place to
+    # the result when it ends, and the only confirmation (no notify-cmd
+    # duplicate on top).
+    sent = [p.get("text", "") for m, p in calls if m == "sendMessage"]
+    edits = [p.get("text", "") for m, p in calls if m == "editMessageText"]
+    if not any("Compressing context" in t for t in sent):
+        failures.append(f"no 'Compressing context' bubble when compaction started: {sent}")
     else:
-        print("ok: compact confirmation fired")
+        print("ok: compaction progress bubble sent")
+    if not any("Context compressed: 765k → 13k tokens" in t for t in edits):
+        failures.append(f"bubble never edited to the result: {edits}")
+    else:
+        print("ok: bubble edited to the compaction result")
+    if any("Context compressed." in " ".join(a) for a in notified):
+        failures.append("notify-cmd confirmation duplicated the bubble")
+    else:
+        print("ok: no duplicate notify-cmd confirmation")
 
     if os.path.exists(marker):
         os.remove(marker)

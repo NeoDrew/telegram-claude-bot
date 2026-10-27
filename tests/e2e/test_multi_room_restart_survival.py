@@ -132,7 +132,7 @@ def main():
         # process, must still be able to kill the spawn the OLD listener
         # process originally launched (kill_room_spawn reads the pid from
         # busy.lock on disk, nothing in-memory).
-        h.inject_callback_query("act:cancel yes", chat_id=DM_CHAT_ID)
+        h.inject_callback_query("act:cancel force", chat_id=DM_CHAT_ID)
         deadline = time.time() + 10
         while time.time() < deadline and os.path.exists(room_a_lock):
             time.sleep(0.2)

@@ -190,10 +190,41 @@ def emit_hang_turn():
                   "partial_json": '{"command":"sleep 999"}'}}})
     emit({"type": "stream_event", "event": {
         "type": "content_block_stop", "index": 0}})
-    # No further events: the tool call never returns. Blocks until an
-    # external signal (a real /cancel SIGTERMs the whole spawn's process
-    # group) tears this process down.
-    signal.pause()
+    # No further events: the tool call never returns. Ends only on an
+    # interrupt control request (the 🛑 cancel button, which the real CLI
+    # answers by ending the turn with error_during_execution) or a signal
+    # (a force stop SIGTERMs the whole spawn's process group). Messages
+    # that arrive meanwhile are kept for after the turn, like the real CLI.
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            signal.pause()
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if (isinstance(obj, dict) and obj.get("type") == "control_request"
+                and (obj.get("request") or {}).get("subtype") == "interrupt"):
+            emit({"type": "control_response", "response": {
+                "subtype": "success", "request_id": obj.get("request_id")}})
+            emit({"type": "result", "subtype": "error_during_execution",
+                  "is_error": True, "duration_ms": 1000})
+            return
+        _stashed.append(line)
+
+
+_stashed = []   # inbox lines read during a hang, answered after it
+
+
+def _stdin_lines():
+    while True:
+        if _stashed:
+            yield _stashed.pop(0)
+            continue
+        line = sys.stdin.readline()
+        if not line:
+            return
+        yield line
 
 
 def load_script():
@@ -257,7 +288,7 @@ def run_turn(turn, turn_index, raw_line):
         time.sleep(float(turn["delay"]))
     if turn.get("hang"):
         emit_hang_turn()
-        return  # unreachable; emit_hang_turn blocks forever
+        return
     if "rate_limit" in turn:
         emit_rate_limit_turn(turn["rate_limit"])
         sys.exit(turn.get("exit_code", 1))
@@ -309,15 +340,22 @@ def main():
             {"message": {"content": prompt}}))
         sys.exit(0)
 
+    replay = "--replay-user-messages" in args
     idx = _load_turn_index()
-    for raw_line in sys.stdin:
+    for raw_line in _stdin_lines():
         line = raw_line.strip()
         if not line:
             continue
         try:
-            json.loads(line)  # validate shape; content parsed lazily below
+            obj = json.loads(line)  # content parsed lazily below
         except Exception:
             continue
+        if not isinstance(obj, dict) or obj.get("type") != "user":
+            continue   # control requests (interrupts) are not turns
+        if replay:
+            # Like the real CLI: echo each line the moment it is read.
+            print(json.dumps({"type": "user", "message": obj.get("message"),
+                              "isReplay": True}), flush=True)
         turn = turns[idx] if idx < len(turns) else {}
         _save_turn_index(idx + 1)
         run_turn(turn, idx, line)

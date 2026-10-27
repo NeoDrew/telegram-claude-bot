@@ -65,6 +65,8 @@ def state_blurb(st):
         return f"🔧 {tn}{f' {dur}s' if dur is not None else ''}"
     if s == "awaiting_result":
         return "⏳ awaiting result"
+    if s == "compacting":
+        return "🗜 compacting"
     if s == "idle":
         return "💤 idle"
     if s == "no_session":
@@ -131,7 +133,7 @@ def collect():
     def sort_key(r):
         is_current = 0 if r["cid"] == CURRENT else 1
         st = r["sstate"].get("state", "no_spawn")
-        is_active = 0 if st in ("streaming", "tool", "awaiting_result") else 1
+        is_active = 0 if st in ("streaming", "tool", "awaiting_result", "compacting") else 1
         return (is_current, is_active, r["label"].lower())
 
     rooms.sort(key=sort_key)
