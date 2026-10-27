@@ -99,11 +99,15 @@ def handle_ask_user(arguments):
 TOOL_DEF = {
     "name": "ask_user",
     "description": (
-        "Ask the user a question via Telegram and block until they respond. "
-        "Use when you genuinely cannot proceed without their input (file overwrites, "
-        "approach choices, missing credentials). Pass options[] for multiple-choice "
-        "(shown as buttons); omit for free-text reply. Blocks up to 5 minutes."
+        "Ask the user a question in their Telegram chat and wait for the answer. "
+        "Use it whenever you offer a choice between a few concrete options (yes/no, "
+        "A or B, which of these): pass them as options[] and they appear as buttons "
+        "the user taps on their phone, instead of a list they have to type back. "
+        "Omit options for a free-text answer. Waits up to 5 minutes."
     ),
+    # Load this tool up front instead of behind tool search: a deferred tool
+    # has to be looked up before every use, so Claude just asked in prose.
+    "_meta": {"anthropic/alwaysLoad": True},
     "inputSchema": {
         "type": "object",
         "properties": {
