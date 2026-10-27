@@ -30,12 +30,11 @@
 # and its already-spawned MCP server children pinned to the stale cache
 # path, are untouched by the update and keep answering with old code.
 #
-# Fix: explicitly kill the room's current spawn (if any) the moment the
-# update succeeds, via the same "stale" path listener.sh's own automatic
-# stale-spawn-refresh uses (kill_room_spawn ... stale); session_id is
-# preserved, no crash-loop stamp, no visible "cancelled" badge. The next
-# message then genuinely starts a fresh process (and fresh MCP server
-# children) against whatever is on disk right now, no ambiguity.
+# Fix: a successful update touches state/.plugins_updated, which
+# listener.sh's stale-spawn check counts as a code change: each room's
+# spawn is restarted (session kept, no "cancelled" badge) at its next
+# message sent between turns, so nothing mid-reply is cut off and every
+# room picks up the new plugin code, not only the one that ran the update.
 #
 # Caveat: `claude plugin update` returns exit 0 even on "Plugin not
 # found" errors, printing a "✘ Failed to update" line instead. We
@@ -81,18 +80,14 @@
       fi
     }
 
-    # Kill the room's current persistent spawn (if any) so the next
-    # message genuinely starts fresh against the just-updated plugin
-    # cache, instead of silently reusing an already-running process (and
-    # its already-spawned MCP server children) that predates the update.
-    # Returns the right trailing sentence for either case.
+    # Running spawns (and their MCP server children) predate the update.
+    # Rather than stopping this room's mid-reply, mark the update:
+    # listener.sh's stale-spawn check restarts each room's spawn (session
+    # kept) at its next message sent between turns, every room, not just
+    # this one.
     restart_note_after_update() {
-      if is_busy "$ROOM_CHAT_ID"; then
-        kill_room_spawn "$ROOM_DIR" stale
-        echo "_Current session stopped so the next message reconnects with the updated plugin code (conversation preserved)._"
-      else
-        echo "_Next message starts a fresh process with the updated plugin code._"
-      fi
+      touch "$REPO_ROOT/state/.plugins_updated"
+      echo "_Each chat switches to the updated plugin code from its next message; nothing running now is interrupted._"
     }
 
     if [[ "$SUBCMD" == "update-all" ]]; then

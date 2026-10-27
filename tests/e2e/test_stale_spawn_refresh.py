@@ -74,6 +74,19 @@ def _before_newest_code(h, by=3600):
     return int(min(newest or time.time(), time.time())) - by
 
 
+def _stub_state(h, state):
+    """Make the sandboxed spawn_state.classify() report `state`. The fake
+    claude writes no transcript, so the real classify() can never say
+    "idle", and the refresh only fires between turns."""
+    stub = (
+        "def classify(room_state_dir):\n"
+        f"    return {{'state': {state!r}, 'wrapper_pid_alive': True}}\n"
+        "def emoji_for_injected_state(state):\n"
+        "    return '\U0001F440' if state == 'idle' else '\U0001FAE1'\n")
+    with open(os.path.join(h.sandbox, "scripts", "spawn_state.py"), "w") as f:
+        f.write(stub)
+
+
 def _busy_pid(h):
     raw = h.read_room_file(DM_CHAT_ID, "busy.lock", default="").strip()
     return int(raw) if raw.isdigit() else None
@@ -90,6 +103,7 @@ def case_stale_spawn_refreshed_transparently():
     try:
         h.setup(fake_claude_script=script_path,
                 extra_env={"BOT_DRAFT_STREAMING": "0"})
+        _stub_state(h, "idle")
         h.start_listener()
 
         h.inject_dm("hello there", message_id=1)
@@ -173,6 +187,7 @@ def case_current_spawn_left_alone():
     try:
         h.setup(fake_claude_script=script_path,
                 extra_env={"BOT_DRAFT_STREAMING": "0"})
+        _stub_state(h, "idle")
         h.start_listener()
 
         h.inject_dm("hello there", message_id=1)
@@ -220,6 +235,7 @@ def case_missing_marker_falls_back_to_busy_lock_mtime():
     try:
         h.setup(fake_claude_script=script_path,
                 extra_env={"BOT_DRAFT_STREAMING": "0"})
+        _stub_state(h, "idle")
         h.start_listener()
 
         h.inject_dm("hello there", message_id=1)
@@ -292,8 +308,46 @@ def case_missing_marker_falls_back_to_busy_lock_mtime():
         os.unlink(script_path)
 
 
+def case_mid_turn_spawn_not_killed():
+    """BUG FIXED: the refresh used to kill a spawn that was mid-reply."""
+    h = E2EHarness(label="stale-spawn-mid-turn")
+    fd, script_path = tempfile.mkstemp(suffix=".json", prefix="fake-claude-script-")
+    os.close(fd)
+    write_fake_claude_script(script_path, [
+        {"text": "first reply"},
+        {"text": "second reply, same spawn"},
+    ])
+    try:
+        h.setup(fake_claude_script=script_path,
+                extra_env={"BOT_DRAFT_STREAMING": "0"})
+        _stub_state(h, "tool")
+        h.start_listener()
+        h.inject_dm("hello there", message_id=1)
+        h.wait_for_call("editMessageText",
+                         lambda p: "first reply" in p.get("text", ""), timeout=20)
+        pid_before = _busy_pid(h)
+        h.seed_room_file(DM_CHAT_ID, ".spawn_started_at", str(_before_newest_code(h)))
+        h.inject_dm("still there?", message_id=2)
+        h.wait_for_call("editMessageText",
+                         lambda p: "second reply, same spawn" in p.get("text", ""), timeout=20)
+        assert _busy_pid(h) == pid_before, "a mid-turn spawn was killed for a refresh"
+        log = open(os.path.join(h.sandbox, "logs", "listener.log")).read()
+        assert "refresh deferred" in log, "the deferral was not logged"
+        print("ok: a stale spawn that is mid-turn is left running; the refresh waits")
+        return True
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        h.keep_sandbox = True
+        return False
+    finally:
+        h.teardown()
+        os.unlink(script_path)
+
+
 def main():
     results = {
+        "mid_turn_spawn_not_killed": case_mid_turn_spawn_not_killed(),
         "stale_spawn_refreshed_transparently": case_stale_spawn_refreshed_transparently(),
         "current_spawn_left_alone": case_current_spawn_left_alone(),
         "missing_marker_falls_back_to_busy_lock_mtime":

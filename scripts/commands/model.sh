@@ -118,10 +118,11 @@ Examples: /model fable, /model claude-opus-4-8[1m], /model default"
     fi
     [[ "$MODEL" != "$CUR_MODEL" ]] && reset_effort_for_model_change
     echo "$MODEL" > "$MODEL_FILE"
+    # A running spawn is never stopped for this: listener.sh's stale-spawn
+    # check sees the newer model file and restarts it (session kept) at the
+    # next message sent between turns.
     if is_busy "$ROOM_CHAT_ID"; then
-      touch "$ROOM_DIR/.user_cancel"
-      kill_room_spawn "$ROOM_DIR" 0
-      echo "Model set to $MODEL. Current session stopped; send a message to reconnect with the new model (session preserved).${EFFORT_NOTE}"
+      echo "Model set to $MODEL. It takes over from your next message; anything running now finishes first.${EFFORT_NOTE}"
     else
       echo "Model set to $MODEL for this room.${EFFORT_NOTE}"
     fi

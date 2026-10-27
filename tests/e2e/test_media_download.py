@@ -102,6 +102,25 @@ def main():
         assert len(contents) == 3, "burst photos overwrote each other"
         print("ok: a 3-photo burst in the same second saves 3 distinct files")
 
+        # 4b. Every photo of the album reaches Claude, uncaptioned ones too,
+        # as ONE message (the burst debounce coalesces them), carrying the
+        # saved paths for Claude's Read tool.
+        inbox = os.path.join(h.room_dir(str(CHAT)), "inbox.ndjson")
+        deadline = time.time() + 15
+        line = ""
+        while time.time() < deadline:
+            if os.path.exists(inbox):
+                lines = [l for l in open(inbox).read().splitlines() if "photo_1791000000_601" in l]
+                if lines:
+                    line = lines[0]
+                    break
+            time.sleep(0.2)
+        assert line, "the album never reached Claude's inbox"
+        assert all(f"photo_1791000000_{m}.jpg" in line for m in (601, 602, 603)), \
+            f"the album was not coalesced into one message: {line[:300]}"
+        assert "Read tool" in line
+        print("ok: the whole album reaches Claude as one message with every saved path")
+
         # 5. Two documents with the same name: the second must not overwrite
         # the first.
         media_update(h, "document", {"file_id": "docA", "file_name": "report.pdf"}, 701)

@@ -1088,16 +1088,38 @@ except Exception:
       if [[ "$_bin_m" =~ ^[0-9]+$ ]] && { [[ ! "$_newest_code" =~ ^[0-9]+$ ]] || (( _bin_m > _newest_code )); }; then
         _newest_code=$_bin_m
       fi
-      # A changed auto-compact threshold counts too: the env var it sets is
-      # read once at spawn start (see commands/autocompact.sh).
-      local _ac_m
-      _ac_m=$(stat -f %m "$rd/autocompact" 2>/dev/null)
-      if [[ "$_ac_m" =~ ^[0-9]+$ ]] && { [[ ! "$_newest_code" =~ ^[0-9]+$ ]] || (( _ac_m > _newest_code )); }; then
-        _newest_code=$_ac_m
-      fi
+      # Settings read once at spawn start count too: the room's auto
+      # compact threshold, model and effort, and a plugin update
+      # (commands/plugin.sh touches state/.plugins_updated). Those handlers
+      # no longer stop a running spawn themselves; this applies them at
+      # the next message instead.
+      local _f _m
+      for _f in "$rd/autocompact" "$rd/model" "$rd/effort" "$STATE_DIR/.plugins_updated"; do
+        _m=$(stat -f %m "$_f" 2>/dev/null)
+        if [[ "$_m" =~ ^[0-9]+$ ]] && { [[ ! "$_newest_code" =~ ^[0-9]+$ ]] || (( _m > _newest_code )); }; then
+          _newest_code=$_m
+        fi
+      done
       if [[ "$_newest_code" =~ ^[0-9]+$ ]] && (( _newest_code > _spawn_started )); then
-        log "  stale spawn chat=$chat_id: started=$_spawn_started code_mtime=$_newest_code, refreshing before dispatch"
-        kill_room_spawn "$rd" stale
+        # Only between turns. BUG FIXED: this used to kill a spawn that was
+        # mid-reply, so the reply stopped mid-sentence and follow-ups
+        # already queued in its inbox were thrown away. A busy spawn keeps
+        # its old code for this message; a later one, sent between turns,
+        # refreshes it.
+        local _st
+        _st=$(REPO_ROOT="$REPO_ROOT" ROOM_DIR="$rd" python3 -c "
+import sys, os
+sys.path.insert(0, os.path.join(os.environ['REPO_ROOT'], 'scripts'))
+from pathlib import Path
+from spawn_state import classify
+print(classify(Path(os.environ['ROOM_DIR'])).get('state', ''))
+" 2>/dev/null)
+        if [[ "$_st" == "idle" ]]; then
+          log "  stale spawn chat=$chat_id: started=$_spawn_started code_mtime=$_newest_code, refreshing before dispatch"
+          kill_room_spawn "$rd" stale
+        else
+          log "  stale spawn chat=$chat_id: state=${_st:-unknown}, mid-turn, refresh deferred"
+        fi
       fi
     fi
   fi
@@ -1708,31 +1730,32 @@ PYEOF
         DL_DEST="$(unique_download_dest "$DL_FILE_NAME")"
         DL_FILE_NAME="$(basename "$DL_DEST")"
         log "  photo: file_id=${DL_FILE_ID} name=${DL_FILE_NAME} caption='${PHOTO_CAPTION:0:60}'"
-        if CHAT_ID="$FROM_CHAT" "$SCRIPTS/tg.sh" download_file "$DL_FILE_ID" "$DL_DEST" >>"$LOG" 2>&1; then
-          CHAT_ID="$FROM_CHAT" "$SCRIPTS/tg.sh" send "📷 Saved **${DL_FILE_NAME}** to ~/Downloads." >>"$LOG" 2>&1 || true
-          log "  photo: saved $DL_DEST"
-          # If captioned (and a spawn is running or idle), inject image + caption into Claude's inbox
-          if [[ -n "$PHOTO_CAPTION" ]]; then
-            NAME_PREFIX="${FROM_NAME:+[$FROM_NAME]: }"
-            PHOTO_PATH="$DL_DEST" CAPTION_TEXT="${NAME_PREFIX}${PHOTO_CAPTION}" \
-              python3 >> "$ROOMS_DIR/$FROM_CHAT/inbox.ndjson" <<'PYEOF'
-import json, base64, os
-img = open(os.environ['PHOTO_PATH'], 'rb').read()
-b64 = base64.b64encode(img).decode()
-msg = {"type": "user", "message": {"role": "user", "content": [
-    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
-    {"type": "text", "text": os.environ.get('CAPTION_TEXT', '')}
-]}}
-print(json.dumps(msg))
-PYEOF
-            log "  photo: injected image+caption into inbox for $FROM_CHAT"
-          fi
-        else
-          CHAT_ID="$FROM_CHAT" "$SCRIPTS/tg.sh" send "❌ Failed to download photo. Check logs/listener.log." >>"$LOG" 2>&1 || true
-          log "  photo: download failed"
+        DL_ERR_TMP=$(mktemp)
+        if ! CHAT_ID="$FROM_CHAT" "$SCRIPTS/tg.sh" download_file "$DL_FILE_ID" "$DL_DEST" >>"$LOG" 2>"$DL_ERR_TMP"; then
+          DL_REASON=$(sed 's/tg\.sh: //' "$DL_ERR_TMP" | head -1)
+          CHAT_ID="$FROM_CHAT" "$SCRIPTS/tg.sh" send "❌ Couldn't save that photo: ${DL_REASON:-Telegram sent no file}. Try sending it again." >>"$LOG" 2>&1 || true
+          log "  photo: download failed: $DL_REASON"
+          rm -f "$DL_ERR_TMP"
+          echo "$NEW_OFFSET" > "$OFFSET_FILE"; OFFSET=$NEW_OFFSET
+          continue
         fi
-        echo "$NEW_OFFSET" > "$OFFSET_FILE"; OFFSET=$NEW_OFFSET
-        continue
+        rm -f "$DL_ERR_TMP"
+        log "  photo: saved $DL_DEST"
+        # Every photo (captioned or not, every photo of an album) goes to
+        # Claude as an ordinary message through dispatch() below, so it gets
+        # the same queueing, burst debounce (an album's photos arrive a beat
+        # apart and coalesce into one turn), reactions and spawn handling as
+        # text. Claude opens the saved file with its Read tool. BUG FIXED:
+        # captioned photos used to be written straight into inbox.ndjson
+        # (no .pending_reacts line, so every later reaction landed one
+        # message off; dropped when no spawn was reading), and uncaptioned
+        # photos or the rest of an album never reached Claude at all.
+        PHOTO_NOTE="[Photo saved at ${DL_DEST}. Open it with the Read tool to see it.]"
+        if [[ -n "$PHOTO_CAPTION" ]]; then
+          TEXT="${PHOTO_CAPTION}"$'\n\n'"${PHOTO_NOTE}"
+        else
+          TEXT="$PHOTO_NOTE"
+        fi
       fi
       if [[ -z "$TEXT" ]]; then
         # Non-text message (photo, voice, sticker, etc). Reply once per

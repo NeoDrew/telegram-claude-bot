@@ -398,28 +398,28 @@ PLUGINSTUB
 chmod +x "$FAKE_PLUGIN_CLAUDE"
 export CLAUDE_BIN="$FAKE_PLUGIN_CLAUDE"
 
-# Busy case: a real background process stands in for the room's persistent
-# spawn wrapper (busy.lock stores its pid, exactly like a live spawn).
+# A running spawn is NOT stopped (that cut replies off mid-sentence); the
+# update is marked in state/.plugins_updated, which listener.sh's stale-spawn
+# check applies at each room's next message between turns.
 sleep 100 &
 SPAWN_PID=$!
 echo "$SPAWN_PID" > "$ROOM/busy.lock"
+rm -f "$TMP/state/.plugins_updated"
 run "plugin update-all"
-assert_contains "busy plugin update reports session stopped" "$(tg_calls)" "Current session stopped"
-sleep 0.8   # kill_room_spawn: TERM, sleep 0.5, KILL
-if kill -0 "$SPAWN_PID" 2>/dev/null; then
-  _fail "busy plugin update actually kills the old spawn" "pid $SPAWN_PID still alive"
-  kill -9 "$SPAWN_PID" 2>/dev/null
-else
-  _pass "busy plugin update actually kills the old spawn"
-fi
-assert_no_file     "busy.lock removed after kill"     "$ROOM/busy.lock"
-assert_file_exists "stale_refresh marker left for the next spawn's wrapper to consume" "$ROOM/.stale_refresh"
-rm -f "$ROOM/.stale_refresh"
+assert_contains "plugin update says it applies from the next message" "$(tg_calls)" "from its next message"
+assert_eq "plugin update leaves the running spawn alone" "$(kill -0 "$SPAWN_PID" 2>/dev/null && echo alive)" "alive"
+assert_file_exists "plugin update marks every room for refresh" "$TMP/state/.plugins_updated"
+kill -9 "$SPAWN_PID" 2>/dev/null; rm -f "$ROOM/busy.lock"
 
-# Idle case: no busy.lock at all, nothing to kill, different (accurate) copy.
-run "plugin update-all"
-assert_contains "idle plugin update reports fresh process" "$(tg_calls)" "Next message starts a fresh process"
-assert_no_file  "idle plugin update touches no stale marker" "$ROOM/.stale_refresh"
+# Changing the model mid-reply must not stop the reply either; the
+# stale-spawn check applies it at the next message between turns.
+sleep 100 &
+SPAWN_PID=$!
+echo "$SPAWN_PID" > "$ROOM/busy.lock"
+run "model haiku"
+assert_contains "busy model change applies from the next message" "$OUT$(tg_calls)" "takes over from your next message"
+assert_eq "busy model change leaves the running spawn alone" "$(kill -0 "$SPAWN_PID" 2>/dev/null && echo alive)" "alive"
+kill -9 "$SPAWN_PID" 2>/dev/null; rm -f "$ROOM/busy.lock" "$ROOM/model" "$ROOM/effort"
 
 unset CLAUDE_BIN
 
