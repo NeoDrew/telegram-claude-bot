@@ -224,7 +224,7 @@ start_spawn() {
   local chat_id="$2"
   # Space-separated Telegram message_ids this spawn is about to answer,
   # threaded through to inject_to_inbox so the streamer can flip their
-  # 🫡/😴 "queued" reaction to 👍 once this turn actually completes (see
+  # 🫡/😴 "queued" reaction to 👀 once Claude reads it (see
   # inject_to_inbox and stream_to_telegram.py's .pending_reacts handling).
   # Empty for scheduled/internal spawns, which have no Telegram message to
   # react to.
@@ -721,9 +721,9 @@ print(classify(Path(os.environ['ROOM_DIR'])).get('state', ''))
 # CLAUDE.md), so every call here corresponds to exactly one future turn,
 # and we push a matching line to .pending_reacts (JSON array, empty when
 # msg_ids is blank e.g. the synthetic "/compact" inject) so the two files
-# always stay 1:1. stream_to_telegram.py pops the oldest .pending_reacts
-# line on every completed turn and flips those messages' 🫡/😴 "queued"
-# reaction to 👍, closing the "emoji never updates once Claude actually
+# always stay 1:1. stream_to_telegram.py reads .pending_reacts by
+# index as Claude reads each inbox line and flips those messages' 🫡/😴 "queued"
+# reaction to 👀, closing the "emoji never updates once Claude actually
 # saw it" gap. Kept 1:1-by-construction
 # deliberately: every caller that truncates inbox.ndjson (crash salvage,
 # circuit breaker, kill_room_spawn, the self-seed branch) ALSO truncates
@@ -735,7 +735,7 @@ print(classify(Path(os.environ['ROOM_DIR'])).get('state', ''))
 # Newlines are stored as \x1e; the Telegram message ids the text carries
 # follow a \x1f (which Telegram text never contains: the parser splits
 # updates on it), so the drain can hand them on and the streamer can move
-# those messages to 👀 when Claude reads them and 👍 when it has answered.
+# those messages to 👀 when Claude reads them.
 # BUG FIXED: queued messages (idle-chat debounce, Claude starting or
 # stopping, a rate-limit hold) used to lose their ids, so their reaction
 # never changed and the first message to an idle chat got none at all.
@@ -1024,7 +1024,7 @@ except Exception:
       CHAT_ID="$chat_id" "$SCRIPTS/tg.sh" edit_html "$ASK_MSG_ID" "$EDIT_TXT" >/dev/null 2>&1 || true
     fi
     if [[ -n "${USER_MSG_ID:-}" ]]; then
-      CHAT_ID="$chat_id" "$SCRIPTS/tg.sh" react "$USER_MSG_ID" "👍" 2>/dev/null || true
+      CHAT_ID="$chat_id" "$SCRIPTS/tg.sh" react "$USER_MSG_ID" "👀" 2>/dev/null || true
     fi
     return 0
   fi

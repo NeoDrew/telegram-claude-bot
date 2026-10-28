@@ -9,20 +9,21 @@ synthetic lines like "/compact" or an interrupt request), so the two files
 are line-for-line parallel. spawn_claude.sh runs claude with
 --replay-user-messages, which echoes each inbox line the moment it is
 read, mid-turn included. The streamer matches those echoes to inbox lines:
-a read line gets 👀, and every line a turn read gets 👍 when that turn's
-result lands. BUG FIXED: the streamer used to pop one .pending_reacts line
+a read line gets 👀, and nothing more when the turn's result lands (a
+reaction at the end of a long reply notified the user about a message far
+up the chat). BUG FIXED: the streamer used to pop one .pending_reacts line
 per result, so a message Claude folded into a running turn kept its 🫡 for
-ever and later turns' 👍 landed on the wrong messages.
+ever and later reactions landed on the wrong messages.
 
 Cases (each feeds synthetic stream-json through the real streamer main()
 with REPO sandboxed to a tempdir):
-  1. no echoes (older CLI, the e2e fake): one line per clean result, an
-     errored result reacts to nothing, .pending_reacts is never popped
-  2. a message read mid-turn: 👀 on each echo, 👍 on both at the result
+  1. no echoes (older CLI, the e2e fake): one line per clean result, no
+     reactions at the result, .pending_reacts is never popped
+  2. a message read mid-turn: 👀 on each echo, nothing at the result
   3. "Prompt is too long": /compact plus the same message are re-queued
      once, with the message's reaction ids; a second failure gives up
      with a plain explanation, never "claude error: success"
-  4. an interrupt (🛑 cancel): "Interrupted", 👍 for the cut-short message,
+  4. an interrupt (🛑 cancel): "Interrupted", 👀 only for both messages,
      marker cleared, and the next message is answered normally
 
 Run: python3 tests/test_pending_reacts.py
@@ -152,8 +153,7 @@ def main():
               *text_turn("err"), result(is_error=True, subtype="error_during_execution", text="")]
     calls, room = run(inbox, reacts, events)
     got = reactions(calls)
-    check(got == [(111, "👍"), (222, "👍"), (333, "👍")],
-          "fallback: 👍 per clean turn, nothing for the errored one", f"got {got}")
+    check(got == [], "fallback: no reaction when a turn ends", f"got {got}")
     check((room / ".turns_done").read_text().strip() == "2",
           "fallback: .turns_done counts the two answered lines")
     check((room / ".pending_reacts").read_text() == "[111]\n[222, 333]\n[444]\n",
@@ -165,8 +165,8 @@ def main():
               *text_turn("both answered"), result()]
     calls, room = run(inbox, [[1], [2]], events)
     got = reactions(calls)
-    check(got == [(1, "👀"), (2, "👀"), (1, "👍"), (2, "👍")],
-          "mid-turn: 👀 when read, 👍 for both at the result", f"got {got}")
+    check(got == [(1, "👀"), (2, "👀")],
+          "mid-turn: 👀 when read, nothing at the result", f"got {got}")
     check((room / ".turns_done").read_text().strip() == "2",
           "mid-turn: .turns_done covers both lines")
 
@@ -201,8 +201,8 @@ def main():
     check(any("Interrupted" in t for t in texts), "interrupt: says Interrupted")
     check(not any("claude error" in t or "hit an error" in t for t in texts), "interrupt: no error message", f"got {texts}")
     check(not (room / ".interrupt_requested").exists(), "interrupt: marker cleared")
-    got = [r for r in reactions(calls) if r[1] == "👍"]
-    check(got == [(7, "👍"), (8, "👍")], "interrupt: both messages end on 👍", f"got {got}")
+    got = reactions(calls)
+    check(got == [(7, "👀"), (8, "👀")], "interrupt: both messages end on 👀", f"got {got}")
     check((room / ".turns_done").read_text().strip() == "3",
           "interrupt: .turns_done steps over the control line")
 

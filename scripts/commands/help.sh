@@ -26,8 +26,7 @@ Just type a message and it goes straight to Claude. Tap /menu for everything as 
 **Reading the chat**
 
 - 🫡 your message is queued; Claude is busy and will get to it.
-- 👀 Claude has read it.
-- 👍 Claude has answered it.
+- 👀 Claude has read it and is answering. There is no extra reaction when the answer is done, so a long reply never leaves a notification on a message far up the chat.
 - 😴 a usage limit is on; it will be answered automatically when the limit resets.
 - ⏱ "Worked for…" after a reply: how long it took and how full the conversation's memory is. Near full it compresses itself, and shows 🗜 while it does.
 - Buttons in a question from Claude: tap one to answer. They expire after 5 minutes.

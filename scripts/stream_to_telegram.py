@@ -2670,11 +2670,11 @@ def main():
                 _answered = _close_turn(ev)
                 _record_ctx(ev)
                 if not ev.get("is_error") or _is_interrupt:
-                    # Every inbox line this turn read, mid-turn ones
-                    # included, is now answered: flip their queued 🫡/😴/👀
-                    # reactions to 👍 (✅ is NOT in Telegram's curated
-                    # reaction set; it 400s with REACTION_INVALID).
-                    _react([m for n in _answered for m in _pending_ids(n)], "👍")
+                    # Every inbox line this turn read is now answered. No
+                    # reaction for that: 👀 (set when Claude read the line)
+                    # stays. A reaction at the end of a long reply notified
+                    # the user about a message 30 bubbles up, which they had
+                    # to scroll back to just to clear.
                     _write_read_count()
                 # Any other error (rate limit, a too-full context) leaves
                 # .turns_done short of these lines, so the crash salvage
