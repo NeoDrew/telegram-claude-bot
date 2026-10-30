@@ -43,7 +43,7 @@ def main():
         h.inject_dm("start a long task")
         h.wait_for_call(
             "sendMessage",
-            lambda p: "sleep 999" in p.get("text", ""), timeout=20)
+            lambda p: "⚙️ Bash" in p.get("text", ""), timeout=20)
         print("ok: the hanging tool call's marker reached Telegram "
               "(genuinely in-flight, not already finished)")
 

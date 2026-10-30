@@ -48,7 +48,7 @@ def case_real_cancel_does_not_leak_marker():
         h.inject_dm("start a long task")
         h.wait_for_call(
             "sendMessage",
-            lambda p: "sleep 999" in p.get("text", ""), timeout=20)
+            lambda p: "⚙️ Bash" in p.get("text", ""), timeout=20)
 
         # act:cancel force -> kill_room_spawn(paint_cancel=1) touches
         # .user_cancel, sends SIGTERM, the wrapper's cleanup() trap fires.

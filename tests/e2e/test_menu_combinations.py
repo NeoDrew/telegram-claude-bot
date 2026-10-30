@@ -173,7 +173,7 @@ def case_menu_action_ignores_busy_state():
 
         h.inject_dm("start a long task")
         h.wait_for_call("sendMessage",
-                         lambda p: "sleep 999" in p.get("text", ""), timeout=20)
+                         lambda p: "⚙️ Bash" in p.get("text", ""), timeout=20)
         busy_lock = os.path.join(h.room_dir(DM_CHAT_ID), "busy.lock")
         assert os.path.exists(busy_lock), "expected the room to be genuinely busy"
 
@@ -222,7 +222,7 @@ def case_bare_cancel_has_no_confirm_step():
 
         h.inject_dm("start a long task")
         h.wait_for_call("sendMessage",
-                         lambda p: "sleep 999" in p.get("text", ""), timeout=20)
+                         lambda p: "⚙️ Bash" in p.get("text", ""), timeout=20)
         busy_lock = os.path.join(h.room_dir(DM_CHAT_ID), "busy.lock")
         assert os.path.exists(busy_lock)
 

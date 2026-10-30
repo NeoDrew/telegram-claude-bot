@@ -230,7 +230,7 @@ def case_rapid_double_cancel():
 
         h.inject_dm("start a long task")
         h.wait_for_call("sendMessage",
-                         lambda p: "sleep 999" in p.get("text", ""), timeout=20)
+                         lambda p: "⚙️ Bash" in p.get("text", ""), timeout=20)
 
         # Two taps back to back, the way an impatient real user actually
         # behaves (tap again because nothing visibly happened yet), not one

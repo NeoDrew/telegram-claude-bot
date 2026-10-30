@@ -64,7 +64,7 @@ def main():
         # --- get all three rooms into their target states BEFORE restart ---
         h.inject_dm("start a long task", message_id=1)
         h.wait_for_call("sendMessage",
-                         lambda p: "sleep 999" in p.get("text", ""),
+                         lambda p: "⚙️ Bash" in p.get("text", ""),
                          timeout=20)
         room_a_lock = os.path.join(h.room_dir(DM_CHAT_ID), "busy.lock")
         with open(room_a_lock) as f:
