@@ -188,6 +188,8 @@ def run_scenario(label, event_gen, group_mode=True):
         os.path.join(SCRIPTS, "stream_to_telegram.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    # Full markers: these cases check tool previews (compact is the default).
+    mod._load_verbosity = lambda: {"tool_calls": "on", "edits": "diff", "thinking": "on"}
     mod.TELEGRAM_BOT_TOKEN = "fake-token"
     mod.TELEGRAM_CHAT_ID = chat_id
     mod.API_URL = "https://api.telegram.org/botfake-token"

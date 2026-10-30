@@ -160,6 +160,8 @@ def run_test():
     os.environ.setdefault("TELEGRAM_BOT_TOKEN", "fake-token")
     os.environ.setdefault("TELEGRAM_CHAT_ID", "0")
     spec.loader.exec_module(mod)
+    # Full markers: these cases check tool previews (compact is the default).
+    mod._load_verbosity = lambda: {"tool_calls": "on", "edits": "diff", "thinking": "on"}
     mod.TELEGRAM_BOT_TOKEN = "fake-token"
     mod.TELEGRAM_CHAT_ID = "0"
     mod.API_URL = "https://api.telegram.org/botfake-token"

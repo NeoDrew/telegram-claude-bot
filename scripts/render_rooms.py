@@ -22,6 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.environ["REPO_ROOT"], "scripts"))
 import room_state  # single source of truth for sessions.json
+import cache_info
 
 BOT = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 API_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org")
@@ -128,6 +129,7 @@ def collect():
             "ago": ago,
             "kind": "👥" if cid.startswith("-") else "👤",
             "sstate": sstate,
+            "cache": cache_info.line(room),
         })
 
     def sort_key(r):
@@ -160,6 +162,8 @@ def main():
         here = "  ← you are here" if r["cid"] == CURRENT else ""
         lines.append(f"\n{r['kind']} **{r['label']}**{here}")
         lines.append(f"  {' · '.join(bits)}")
+        if r["cache"]:
+            lines.append(f"  {r['cache']}")
         lines.append(f"  _id: `{r['cid']}`_")
         # A forget button for every room except the one you're sending from
         # (you can't forget yourself). Executes immediately, no confirm step.

@@ -1081,7 +1081,7 @@ _showing_thinking: bool = False
 # state/rooms/<chat>/verbosity. Cached for the turn so a setting change
 # mid-stream doesn't half-apply (next turn picks up the change).
 # Schema: {"tool_calls": "on|off", "edits": "diff|marker|off", "thinking": "on|off"}
-_verbosity: dict = {"tool_calls": "on", "edits": "diff", "thinking": "on"}
+_verbosity: dict = {"tool_calls": "compact", "edits": "compact", "thinking": "on"}
 
 # Tool names whose markers/diffs are governed by `verbosity.edits` (not by
 # `verbosity.tool_calls`). Anything else falls under `verbosity.tool_calls`.
@@ -1108,7 +1108,7 @@ def _load_verbosity() -> dict:
     """Read the current room's verbosity dict (defaults on any error)."""
     if _verbosity_mod is None or not TELEGRAM_CHAT_ID:
         return dict(_verbosity_mod.DEFAULTS) if _verbosity_mod else {
-            "tool_calls": "on", "edits": "diff", "thinking": "on"}
+            "tool_calls": "compact", "edits": "compact", "thinking": "on"}
     try:
         return _verbosity_mod.load(REPO, TELEGRAM_CHAT_ID)
     except Exception:
@@ -1814,6 +1814,18 @@ def _recover_prompt_too_long(lines: list) -> bool:
         log(f"prompt-too-long recovery failed: {e}")
         return False
     return True
+
+
+def _record_cache(ev: dict):
+    """When this chat's prompt cache was last refreshed, for the cache
+    timer (cache_info.py) in the footer, status and rooms screens."""
+    try:
+        import cache_info
+        st = cache_info.from_result(ev)
+        if st:
+            _room_path(".cache_state").write_text(json.dumps(st))
+    except Exception:
+        pass
 
 
 def _record_ctx(ev: dict):
@@ -2793,6 +2805,7 @@ def main():
                                  and _room_path(".interrupt_requested").exists())
                 _answered = _close_turn(ev)
                 _record_ctx(ev)
+                _record_cache(ev)
                 if not ev.get("is_error") or _is_interrupt:
                     # Every inbox line this turn read is now answered. No
                     # reaction for that: 👀 (set when Claude read the line)
@@ -2997,7 +3010,13 @@ def main():
                         # later deadline), so the retry needs its own
                         # _wait_for_cooldown call, not just the one before
                         # the first attempt.
-                        footer_text = f"⏱ _Worked for {_dstr}{ctx_part}{rl_part}_"
+                        try:
+                            _cs = json.loads(_room_path(".cache_state").read_text())
+                            _until = time.strftime("%H:%M", time.localtime(_cs["at"] + _cs["ttl"]))
+                            cache_part = f" · 🧊 till {_until}"
+                        except Exception:
+                            cache_part = ""
+                        footer_text = f"⏱ _Worked for {_dstr}{ctx_part}{cache_part}{rl_part}_"
                         _wait_for_cooldown("turn-end footer")
                         if tg_send(footer_text, keyboard=footer_kb) is None:
                             _wait_for_cooldown("turn-end footer retry")

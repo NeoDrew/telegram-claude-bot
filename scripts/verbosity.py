@@ -8,9 +8,9 @@ Schema (state/rooms/<chat>/verbosity, JSON):
       "thinking":   "on" | "off"
     }
 
-Defaults (file absent OR key missing): tool_calls=on, edits=diff, thinking=on
-This preserves the original full-noise behaviour for rooms that never opened
-the verbosity screen.
+Defaults (file absent OR key missing): tool_calls=compact, edits=compact,
+thinking=on. Compact became the default on 2026-10-30; full markers and
+diffs are one tap away on the verbosity screen.
 
 Independence rule: the three keys gate three distinct outputs and don't cross
 over. In particular `edits` controls BOTH the inline 📝 marker (in the live
@@ -35,7 +35,7 @@ import json
 import sys
 from pathlib import Path
 
-DEFAULTS = {"tool_calls": "on", "edits": "diff", "thinking": "on"}
+DEFAULTS = {"tool_calls": "compact", "edits": "compact", "thinking": "on"}
 VALID = {
     "tool_calls": ("on", "compact"),
     "edits":      ("diff", "marker", "compact"),

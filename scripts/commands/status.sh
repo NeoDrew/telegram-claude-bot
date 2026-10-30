@@ -263,6 +263,15 @@ else:
     ]
     if last_spawn:
         lines.append(f"  Last spawn:    {last_spawn}")
+    try:
+        import sys as _sys
+        _sys.path.insert(0, os.environ['REPO_ROOT'] + '/scripts')
+        import cache_info
+        _c = cache_info.line(os.environ['ROOM_DIR'])
+        if _c:
+            lines.append(f"  Cache:        {_c}")
+    except Exception:
+        pass
 
     # ---- last N session events from claude's transcript ----
     # The transcript file lives at:
