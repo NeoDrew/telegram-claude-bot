@@ -15,7 +15,8 @@ from Anthropic's model table, 2026-10. A cache write is 2x input for the
 1 hour cache and 1.25x for the 5 minute one. On a subscription nothing is
 billed per token; the figure is the list-price equivalent.
 
-Used by stream_to_telegram.py (record, footer), render_rooms.py and
+Used by stream_to_telegram.py (record; edits the last footer to say the
+cache is cold once it expires), render_rooms.py and
 commands/status.sh (CLI: cache_info.py line <room_dir>).
 """
 from __future__ import annotations
@@ -86,20 +87,26 @@ def _money(x: float) -> str:
     return f"${x:.2f}" if x >= 0.1 else f"${x:.3f}"
 
 
+def cold_note(st: dict) -> str:
+    """Added to the last footer once the cache has expired."""
+    c = costs(st)
+    return (f"_Cache cold · next message ≈ {_money(c[0])}_" if c
+            else "_Cache cold_")
+
+
 def line(room_dir, now: float | None = None) -> str:
-    """e.g. "🧊 cache 42m left · miss ≈ $2.68 (cached $0.07)"."""
+    """e.g. "Cache expires in 42m · miss ≈ $2.68 (cached $0.067)"."""
     st = load(room_dir)
     if not st:
         return ""
     left = remaining(st, now)
     c = costs(st)
-    tail = f" · next msg ≈ {_money(c[0])}" if c and left <= 0 else (
-        f" · miss ≈ {_money(c[0])} (cached {_money(c[1])})" if c else "")
     if left <= 0:
-        return f"🧊 cache expired{tail}"
+        return "Cache cold" + (f" · next message ≈ {_money(c[0])}" if c else "")
     m = left // 60
     when = f"{m}m" if m else f"{left}s"
-    return f"🧊 cache {when} left{tail}"
+    tail = f" · miss ≈ {_money(c[0])} (cached {_money(c[1])})" if c else ""
+    return f"Cache expires in {when}{tail}"
 
 
 if __name__ == "__main__":

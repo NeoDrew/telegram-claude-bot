@@ -269,7 +269,7 @@ else:
         import cache_info
         _c = cache_info.line(os.environ['ROOM_DIR'])
         if _c:
-            lines.append(f"  Cache:        {_c}")
+            lines.append(f"  {_c}")
     except Exception:
         pass
 

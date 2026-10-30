@@ -1816,16 +1816,89 @@ def _recover_prompt_too_long(lines: list) -> bool:
     return True
 
 
+_cold_timer = None
+
+
+def _cancel_cold_timer():
+    global _cold_timer
+    if _cold_timer is not None:
+        _cold_timer.cancel()
+        _cold_timer = None
+
+
+def _remember_footer(mid, text, kb):
+    """Note the last footer so it can be marked when the cache goes cold."""
+    try:
+        f = _room_path(".cache_state")
+        st = json.loads(f.read_text())
+        st.update(footer_mid=mid, footer_text=text, footer_kb=kb)
+        f.write_text(json.dumps(st))
+    except Exception:
+        return
+    _schedule_cold()
+
+
+def _schedule_cold():
+    """Edit the last footer once the prompt cache has expired. Re-armed at
+    every reply and at streamer start (a refreshed spawn picks up the
+    previous process's footer); cancelled when a new turn starts."""
+    global _cold_timer
+    _cancel_cold_timer()
+    try:
+        import cache_info
+        st = json.loads(_room_path(".cache_state").read_text())
+    except Exception:
+        return
+    if not st.get("footer_mid") or st.get("cold_marked"):
+        return
+    delay = max(0, cache_info.remaining(st)) + 2
+    _cold_timer = threading.Timer(delay, _mark_cold, args=(st.get("at"),))
+    _cold_timer.daemon = True
+    _cold_timer.start()
+
+
+def _mark_cold(at):
+    try:
+        import cache_info
+        f = _room_path(".cache_state")
+        st = json.loads(f.read_text())
+        if st.get("at") != at or st.get("cold_marked") or cache_info.remaining(st) > 0:
+            return
+        note = cache_info.cold_note(st)
+        params = {"chat_id": TELEGRAM_CHAT_ID, "message_id": st["footer_mid"],
+                  "parse_mode": "HTML",
+                  "text": html_format(st["footer_text"] + "\n" + note)}
+        if st.get("footer_kb"):
+            params["reply_markup"] = json.dumps({"inline_keyboard": st["footer_kb"]})
+        tg_api("editMessageText", params)
+        st["cold_marked"] = True
+        f.write_text(json.dumps(st))
+    except Exception as e:
+        log(f"cache cold mark failed: {e}")
+
+
 def _record_cache(ev: dict):
     """When this chat's prompt cache was last refreshed, for the cache
-    timer (cache_info.py) in the footer, status and rooms screens."""
+    timer (cache_info.py) on the status and rooms screens and the
+    cold-cache footer edit. A turn with no footer of its own (a
+    compaction) keeps pointing at the previous footer."""
     try:
         import cache_info
         st = cache_info.from_result(ev)
-        if st:
-            _room_path(".cache_state").write_text(json.dumps(st))
+        if not st:
+            return
+        f = _room_path(".cache_state")
+        try:
+            old = json.loads(f.read_text())
+        except Exception:
+            old = {}
+        for k in ("footer_mid", "footer_text", "footer_kb"):
+            if k in old:
+                st[k] = old[k]
+        f.write_text(json.dumps(st))
     except Exception:
-        pass
+        return
+    _schedule_cold()
 
 
 def _record_ctx(ev: dict):
@@ -1933,6 +2006,7 @@ def main():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         sys.stderr.write("stream_to_telegram: missing TELEGRAM_BOT_TOKEN/CHAT_ID\n")
         sys.exit(2)
+    _schedule_cold()   # a previous process's footer may still be waiting
 
     # live_id / buf are module-level globals (declared at top) so the
     # SIGTERM handler can read them without us mirroring through a dict
@@ -2429,6 +2503,7 @@ def main():
                 itype = inner.get("type")
 
                 if itype == "message_start":
+                    _cancel_cold_timer()   # this call refreshes the cache
                     # New turn: last turn's committed text must not leak
                     # into this one's is_error handling (a genuinely
                     # unannounced error on a turn that streamed nothing
@@ -3010,17 +3085,13 @@ def main():
                         # later deadline), so the retry needs its own
                         # _wait_for_cooldown call, not just the one before
                         # the first attempt.
-                        try:
-                            _cs = json.loads(_room_path(".cache_state").read_text())
-                            _until = time.strftime("%H:%M", time.localtime(_cs["at"] + _cs["ttl"]))
-                            cache_part = f" · 🧊 till {_until}"
-                        except Exception:
-                            cache_part = ""
-                        footer_text = f"⏱ _Worked for {_dstr}{ctx_part}{cache_part}{rl_part}_"
+                        footer_text = f"⏱ _Worked for {_dstr}{ctx_part}{rl_part}_"
                         _wait_for_cooldown("turn-end footer")
-                        if tg_send(footer_text, keyboard=footer_kb) is None:
+                        _fmid = tg_send(footer_text, keyboard=footer_kb)
+                        if _fmid is None:
                             _wait_for_cooldown("turn-end footer retry")
-                            tg_send(footer_text, keyboard=footer_kb)
+                            _fmid = tg_send(footer_text, keyboard=footer_kb)
+                        _remember_footer(_fmid, footer_text, footer_kb)
 
                 # Last, after this reply's footer: it marks the NEXT result
                 # as the compaction.

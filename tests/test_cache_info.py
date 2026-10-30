@@ -23,11 +23,13 @@ d = tempfile.mkdtemp()
 st["at"] = 1000
 open(os.path.join(d, ".cache_state"), "w").write(json.dumps(st))
 l = cache_info.line(d, now=1000 + 18 * 60)
-if l != "🧊 cache 42m left · miss ≈ $2.68 (cached $0.067)":
+if l != "Cache expires in 42m · miss ≈ $2.68 (cached $0.067)":
     fail.append(f"line: {l!r}")
 l = cache_info.line(d, now=1000 + 3700)
-if l != "🧊 cache expired · next msg ≈ $2.68":
+if l != "Cache cold · next message ≈ $2.68":
     fail.append(f"expired line: {l!r}")
+if cache_info.cold_note(st) != "_Cache cold · next message ≈ $2.68_":
+    fail.append(f"cold note: {cache_info.cold_note(st)!r}")
 if cache_info.line(tempfile.mkdtemp()) != "":
     fail.append("no state should give no line")
 if fail:
