@@ -503,6 +503,99 @@ print(json.dumps({'type': 'user', 'message': {'role': 'user', 'content': os.envi
   done < <(printf '%s\x1e' "$output")
 }
 
+# spawn_is_stale <room_dir>: true when the room's persistent spawn started
+# before something it read at start changed: scripts/hooks code, the
+# Claude Code binary, the room's autocompact/model/effort, or a plugin
+# update. Sets _spawn_started and _newest_code for the caller's log line.
+spawn_is_stale() {
+  local rd="$1"
+  _spawn_started="" _newest_code=""
+  _spawn_started=$(cat "$rd/.spawn_started_at" 2>/dev/null)
+  if [[ ! "$_spawn_started" =~ ^[0-9]+$ ]]; then
+    # .spawn_started_at is only written by spawn_claude.sh code that was
+    # added at the same time as this whole check, so EVERY spawn that
+    # was already running before this feature existed has no baseline
+    # and silently fell straight through the check above, forever (the
+    # log line below would never fire for them: the
+    # rooms most in need of a staleness check, the old ones, were
+    # exactly the ones it couldn't see). Fall back to busy.lock's own
+    # mtime, written at the same moment the spawn actually launched, as
+    # the best available approximation for a pre-existing spawn.
+    _spawn_started=$(stat -f %m "$rd/busy.lock" 2>/dev/null)
+  fi
+  if [[ "$_spawn_started" =~ ^[0-9]+$ ]]; then
+    _newest_code=$(code_mtime)
+    # A Claude Code update counts as a code change too (see claude_bin_mtime).
+    local _bin_m
+    _bin_m=$(claude_bin_mtime)
+    if [[ "$_bin_m" =~ ^[0-9]+$ ]] && { [[ ! "$_newest_code" =~ ^[0-9]+$ ]] || (( _bin_m > _newest_code )); }; then
+      _newest_code=$_bin_m
+    fi
+    # Settings read once at spawn start count too: the room's auto
+    # compact threshold, model and effort, and a plugin update
+    # (commands/plugin.sh touches state/.plugins_updated). Those handlers
+    # no longer stop a running spawn themselves; this applies them at
+    # the next message instead.
+    local _f _m
+    for _f in "$rd/autocompact" "$rd/model" "$rd/effort" "$STATE_DIR/.plugins_updated"; do
+      _m=$(stat -f %m "$_f" 2>/dev/null)
+      if [[ "$_m" =~ ^[0-9]+$ ]] && { [[ ! "$_newest_code" =~ ^[0-9]+$ ]] || (( _m > _newest_code )); }; then
+        _newest_code=$_m
+      fi
+    done
+  fi
+  [[ "$_spawn_started" =~ ^[0-9]+$ && "$_newest_code" =~ ^[0-9]+$ ]] \
+    && (( _newest_code > _spawn_started ))
+}
+
+# room_spawn_state <room_dir>: "<state> <seconds since the transcript moved>".
+room_spawn_state() {
+  REPO_ROOT="$REPO_ROOT" ROOM_DIR="$1" python3 -c "
+import sys, os
+sys.path.insert(0, os.path.join(os.environ['REPO_ROOT'], 'scripts'))
+from pathlib import Path
+from spawn_state import classify
+c = classify(Path(os.environ['ROOM_DIR']))
+print(c.get('state', ''), int(c.get('transcript_age_s') or 0))
+" 2>/dev/null
+}
+
+# refresh_idle_stale_spawns: switch a stale spawn to current code once it
+# has sat idle between turns, instead of waiting for a message that lands
+# at an idle moment. BUG FIXED: a busy chat whose messages always arrived
+# mid-turn kept code from many hours earlier (integr8 kept the old full
+# tool markers all day). The session is kept; the next message resumes it.
+# Only when Claude has read every inbox line (kill_room_spawn truncates the
+# inbox), nothing is queued, compacting or waiting on a question, and the
+# room has been quiet for STALE_IDLE_S (60s). Checked every STALE_CHECK_S (60s).
+STALE_IDLE_S=$(bot_config BOT_STALE_IDLE_S 60)
+STALE_CHECK_S=$(bot_config BOT_STALE_CHECK_S 60)
+_last_idle_refresh_check=0
+refresh_idle_stale_spawns() {
+  local now rd chat lines done_n st age lock_m
+  now=$(date +%s)
+  (( now - _last_idle_refresh_check >= STALE_CHECK_S )) || return 0
+  _last_idle_refresh_check=$now
+  for rd in "$ROOMS_DIR"/*/; do
+    rd="${rd%/}"; chat="${rd##*/}"
+    [[ -f "$rd/.inbox_ready" ]] && is_busy "$chat" || continue
+    [[ -s "$rd/queue.jsonl" || -s "$rd/.inject_burst.jsonl" || -f "$rd/.compacting" \
+       || -f "$rd/.compact_in_flight" || -f "$rd/.ask_user_pending.json" ]] && continue
+    spawn_is_stale "$rd" || continue
+    # A spawn started a moment ago may not have rewritten .spawn_started_at
+    # yet; its busy.lock is fresh, so it is not the stale one.
+    lock_m=$(stat -f %m "$rd/busy.lock" 2>/dev/null)
+    [[ "$lock_m" =~ ^[0-9]+$ ]] && (( lock_m < _newest_code )) || continue
+    lines=$(grep -c . "$rd/inbox.ndjson" 2>/dev/null); lines=${lines:-0}
+    done_n=$(cat "$rd/.turns_done" 2>/dev/null)
+    [[ "$done_n" =~ ^[0-9]+$ ]] && (( done_n >= lines )) || continue
+    read -r st age <<< "$(room_spawn_state "$rd")"
+    [[ "$st" == "idle" && "$age" =~ ^[0-9]+$ ]] && (( age >= STALE_IDLE_S )) || continue
+    log "  stale spawn chat=$chat: idle ${age}s, refreshing to current code"
+    kill_room_spawn "$rd" stale
+  done
+}
+
 drain_queue_if_idle() {
   local rd chat_id qf draining combined count
   for rd in "$ROOMS_DIR"/*/; do
@@ -1114,62 +1207,19 @@ except Exception:
   # kill_room_spawn leaves busy.lock removed, so is_busy() below correctly
   # reports false afterward and this message routes through the normal
   # idle path, no other change needed.
-  if is_busy "$chat_id" && [[ -f "$rd/.inbox_ready" ]]; then
-    local _spawn_started _newest_code
-    _spawn_started=$(cat "$rd/.spawn_started_at" 2>/dev/null)
-    if [[ ! "$_spawn_started" =~ ^[0-9]+$ ]]; then
-      # .spawn_started_at is only written by spawn_claude.sh code that was
-      # added at the same time as this whole check, so EVERY spawn that
-      # was already running before this feature existed has no baseline
-      # and silently fell straight through the check above, forever (the
-      # log line below would never fire for them: the
-      # rooms most in need of a staleness check, the old ones, were
-      # exactly the ones it couldn't see). Fall back to busy.lock's own
-      # mtime, written at the same moment the spawn actually launched, as
-      # the best available approximation for a pre-existing spawn.
-      _spawn_started=$(stat -f %m "$rd/busy.lock" 2>/dev/null)
-    fi
-    if [[ "$_spawn_started" =~ ^[0-9]+$ ]]; then
-      _newest_code=$(code_mtime)
-      # A Claude Code update counts as a code change too (see claude_bin_mtime).
-      local _bin_m
-      _bin_m=$(claude_bin_mtime)
-      if [[ "$_bin_m" =~ ^[0-9]+$ ]] && { [[ ! "$_newest_code" =~ ^[0-9]+$ ]] || (( _bin_m > _newest_code )); }; then
-        _newest_code=$_bin_m
-      fi
-      # Settings read once at spawn start count too: the room's auto
-      # compact threshold, model and effort, and a plugin update
-      # (commands/plugin.sh touches state/.plugins_updated). Those handlers
-      # no longer stop a running spawn themselves; this applies them at
-      # the next message instead.
-      local _f _m
-      for _f in "$rd/autocompact" "$rd/model" "$rd/effort" "$STATE_DIR/.plugins_updated"; do
-        _m=$(stat -f %m "$_f" 2>/dev/null)
-        if [[ "$_m" =~ ^[0-9]+$ ]] && { [[ ! "$_newest_code" =~ ^[0-9]+$ ]] || (( _m > _newest_code )); }; then
-          _newest_code=$_m
-        fi
-      done
-      if [[ "$_newest_code" =~ ^[0-9]+$ ]] && (( _newest_code > _spawn_started )); then
-        # Only between turns. BUG FIXED: this used to kill a spawn that was
-        # mid-reply, so the reply stopped mid-sentence and follow-ups
-        # already queued in its inbox were thrown away. A busy spawn keeps
-        # its old code for this message; a later one, sent between turns,
-        # refreshes it.
-        local _st
-        _st=$(REPO_ROOT="$REPO_ROOT" ROOM_DIR="$rd" python3 -c "
-import sys, os
-sys.path.insert(0, os.path.join(os.environ['REPO_ROOT'], 'scripts'))
-from pathlib import Path
-from spawn_state import classify
-print(classify(Path(os.environ['ROOM_DIR'])).get('state', ''))
-" 2>/dev/null)
-        if [[ "$_st" == "idle" ]]; then
-          log "  stale spawn chat=$chat_id: started=$_spawn_started code_mtime=$_newest_code, refreshing before dispatch"
-          kill_room_spawn "$rd" stale
-        else
-          log "  stale spawn chat=$chat_id: state=${_st:-unknown}, mid-turn, refresh deferred"
-        fi
-      fi
+  if is_busy "$chat_id" && [[ -f "$rd/.inbox_ready" ]] && spawn_is_stale "$rd"; then
+    # Only between turns. BUG FIXED: this used to kill a spawn that was
+    # mid-reply, so the reply stopped mid-sentence and follow-ups
+    # already queued in its inbox were thrown away. A busy spawn keeps
+    # its old code for this message; refresh_idle_stale_spawns switches
+    # it over once it has sat idle.
+    local _st
+    _st=$(room_spawn_state "$rd" | cut -d' ' -f1)
+    if [[ "$_st" == "idle" ]]; then
+      log "  stale spawn chat=$chat_id: started=$_spawn_started code_mtime=$_newest_code, refreshing before dispatch"
+      kill_room_spawn "$rd" stale
+    else
+      log "  stale spawn chat=$chat_id: state=${_st:-unknown}, mid-turn, refresh deferred"
     fi
   fi
 
@@ -1878,5 +1928,6 @@ PYEOF
   # we were polling, and if so dequeue the next message.
   drain_queue_if_idle
   drain_inject_burst
+  refresh_idle_stale_spawns
   rescue_missed_wakeups
 done

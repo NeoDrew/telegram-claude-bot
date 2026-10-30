@@ -74,13 +74,14 @@ def _before_newest_code(h, by=3600):
     return int(min(newest or time.time(), time.time())) - by
 
 
-def _stub_state(h, state):
-    """Make the sandboxed spawn_state.classify() report `state`. The fake
-    claude writes no transcript, so the real classify() can never say
-    "idle", and the refresh only fires between turns."""
+def _stub_state(h, state, age=0):
+    """Make the sandboxed spawn_state.classify() report `state`, quiet for
+    `age` seconds. The fake claude writes no transcript, so the real
+    classify() can never say "idle", and the refresh only fires between
+    turns."""
     stub = (
         "def classify(room_state_dir):\n"
-        f"    return {{'state': {state!r}, 'wrapper_pid_alive': True}}\n"
+        f"    return {{'state': {state!r}, 'wrapper_pid_alive': True, 'transcript_age_s': {age}}}\n"
         "def emoji_for_injected_state(state):\n"
         "    return '\U0001F440' if state == 'idle' else '\U0001FAE1'\n")
     with open(os.path.join(h.sandbox, "scripts", "spawn_state.py"), "w") as f:
@@ -345,9 +346,65 @@ def case_mid_turn_spawn_not_killed():
         os.unlink(script_path)
 
 
+def case_idle_stale_spawn_refreshed_without_a_message():
+    """BUG FIXED: a stale spawn was only refreshed when a message happened to
+    land between turns, so a busy chat whose messages all arrived mid-turn
+    kept old code all day. Now it is switched over once it sits idle."""
+    h = E2EHarness(label="stale-spawn-idle")
+    fd, script_path = tempfile.mkstemp(suffix=".json", prefix="fake-claude-script-")
+    os.close(fd)
+    write_fake_claude_script(script_path, [
+        {"text": "first reply"},
+        {"text": "second reply, from a fresh spawn"},
+    ])
+    try:
+        h.setup(fake_claude_script=script_path,
+                extra_env={"BOT_DRAFT_STREAMING": "0",
+                           "BOT_STALE_IDLE_S": "0", "BOT_STALE_CHECK_S": "1"})
+        _stub_state(h, "idle", age=999)
+        h.start_listener()
+        h.inject_dm("hello there", message_id=1)
+        h.wait_for_call("editMessageText",
+                         lambda p: "first reply" in p.get("text", ""), timeout=20)
+        sid_before = h.session_id(DM_CHAT_ID)
+        pid_before = _busy_pid(h)
+        old = _before_newest_code(h)
+        h.seed_room_file(DM_CHAT_ID, ".spawn_started_at", str(old))
+        os.utime(os.path.join(h.room_dir(DM_CHAT_ID), "busy.lock"), (old, old))
+        log_path = os.path.join(h.sandbox, "logs", "listener.log")
+        deadline = time.time() + 20
+        while time.time() < deadline and "refreshing to current code" not in open(log_path).read():
+            time.sleep(0.3)
+        assert "refreshing to current code" in open(log_path).read(), \
+            "an idle stale spawn was not refreshed without a message"
+        print("ok: an idle stale spawn is refreshed with no message needed")
+        assert h.session_id(DM_CHAT_ID) == sid_before, "the session was not kept"
+        assert not [c for c in h.all_calls()
+                    if "cancelled" in c["params"].get("text", "").lower()], \
+            "the idle refresh showed a cancelled badge"
+        print("ok: session kept, nothing shown in the chat")
+        h.inject_dm("still there?", message_id=2)
+        h.wait_for_call("editMessageText",
+                         lambda p: "second reply, from a fresh spawn" in p.get("text", ""),
+                         timeout=20)
+        assert _busy_pid(h) != pid_before, "the next message went to the old process"
+        print("ok: the next message is answered by a fresh process")
+        return True
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        h.keep_sandbox = True
+        return False
+    finally:
+        h.teardown()
+        os.unlink(script_path)
+
+
 def main():
     results = {
         "mid_turn_spawn_not_killed": case_mid_turn_spawn_not_killed(),
+        "idle_stale_spawn_refreshed_without_a_message":
+            case_idle_stale_spawn_refreshed_without_a_message(),
         "stale_spawn_refreshed_transparently": case_stale_spawn_refreshed_transparently(),
         "current_spawn_left_alone": case_current_spawn_left_alone(),
         "missing_marker_falls_back_to_busy_lock_mtime":
