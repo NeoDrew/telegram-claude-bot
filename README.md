@@ -128,6 +128,9 @@ rules for a bot that's allowed to modify its own running code.
 
 ## Caveats
 
+- **`BOT_GROUP_EDIT_INTERVAL`:** seconds between edits of a reply streaming
+  into a group (default 3). Telegram allows about 20 messages a minute per
+  group, edits included.
 - **Security.** The bot has shell access on the host Mac via
   `--dangerously-skip-permissions`. Only the allowlisted chat/user ids are
   answered; everyone else is silently dropped (or captured as "pending" for

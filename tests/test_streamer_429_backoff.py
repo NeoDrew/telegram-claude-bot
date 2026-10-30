@@ -114,6 +114,18 @@ def main():
     else:
         print(f"ok: interval widens from {base}s to {widened:.2f}s at max backoff")
 
+    # Case 2b: groups stream at the slower group pace, DMs at the normal one.
+    saved = mod.TELEGRAM_CHAT_ID
+    mod.TELEGRAM_CHAT_ID = "-100123"
+    g = mod._edit_interval()
+    mod.TELEGRAM_CHAT_ID = "123"
+    d = mod._edit_interval()
+    mod.TELEGRAM_CHAT_ID = saved
+    if g == mod.GROUP_EDIT_INTERVAL and d == mod.EDIT_INTERVAL and g > d:
+        print(f"ok: groups edit every {g}s, private chats every {d}s")
+    else:
+        failures.append(f"case 2b: expected group {mod.GROUP_EDIT_INTERVAL} > dm {mod.EDIT_INTERVAL}, got {g}, {d}")
+
     # Case 3: a sustained clean streak steps the level back down, one at a
     # time, not an instant snap back to 0 on the first success (that would
     # just re-trip the limit immediately, defeating the point).

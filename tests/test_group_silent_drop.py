@@ -145,6 +145,7 @@ def run_scenario(label, reject_send_until_call_n):
     mod.TELEGRAM_CHAT_ID = chat_id
     mod.API_URL = "https://api.telegram.org/botfake-token"
     mod.EDIT_INTERVAL = 0.0
+    mod.GROUP_EDIT_INTERVAL = 0.0
     mod.DRAFT_INTERVAL = 0.0
     # Stub the cooldown wait so the test doesn't actually sleep, but DO
     # collapse the cooldown deadline so subsequent sends in the same call

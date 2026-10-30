@@ -62,6 +62,7 @@ def _load_streamer(chat_id, label):
     mod.TELEGRAM_CHAT_ID = str(chat_id)
     mod.API_URL = "https://api.telegram.org/botfake-token"
     mod.EDIT_INTERVAL = 0.0
+    mod.GROUP_EDIT_INTERVAL = 0.0
     mod.DRAFT_INTERVAL = 0.0
     mod._log_sent = lambda mid: None
     return mod

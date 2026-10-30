@@ -69,6 +69,13 @@ def _log_sent(mid):
         pass
 
 EDIT_INTERVAL = 0.8      # seconds between editMessageText calls per message
+# Groups get a slower pace. Telegram lets a bot send about 20 messages a
+# minute to one group, and edits count, so 0.8s ran into a 429 within the
+# first half minute of a long reply; every 429 then froze the bubble for
+# 10 to 20s before it jumped ahead (stream.log: about 100 a day). One edit
+# every 3s stays near that budget, so the text grows steadily instead.
+# DMs stream with drafts and are unaffected. Override: BOT_GROUP_EDIT_INTERVAL.
+GROUP_EDIT_INTERVAL = 3.0
 MAX_HTML_CHARS = 4000    # Telegram counts the HTML-rendered length against
                          # its 4096 ceiling. Markdown like **bold** / `code` /
                          # pipe-tables expands significantly (a fenced table
@@ -980,6 +987,18 @@ try:
     DRAFT_INTERVAL = max(0.0, float(os.environ.get("BOT_DRAFT_INTERVAL", DRAFT_INTERVAL)))
 except (TypeError, ValueError):
     pass
+try:
+    GROUP_EDIT_INTERVAL = max(0.0, float(os.environ.get("BOT_GROUP_EDIT_INTERVAL", GROUP_EDIT_INTERVAL)))
+except (TypeError, ValueError):
+    pass
+
+
+def _edit_interval() -> float:
+    try:
+        is_group = int(TELEGRAM_CHAT_ID) < 0
+    except (TypeError, ValueError):
+        is_group = False
+    return GROUP_EDIT_INTERVAL if is_group else EDIT_INTERVAL
 _draft_id: int | None = None     # current draft's random id (one per live box)
 _draft_failed = False    # a draft call hard-failed → fall back to edit for the rest
 _draft_used_plain = False  # last shown draft frame fell back to plain text (no HTML)
@@ -1964,7 +1983,7 @@ def main():
         # Scaled by the adaptive 429 backoff multiplier (see its docstring):
         # a room that's been tripping Telegram's flood limit gets a wider
         # gap here until it earns its way back down via clean calls.
-        interval = (DRAFT_INTERVAL if _live_id == DRAFT_LIVE else EDIT_INTERVAL) \
+        interval = (DRAFT_INTERVAL if _live_id == DRAFT_LIVE else _edit_interval()) \
             * _rl_backoff_multiplier()
         if not (force or (now - last_edit) >= interval):
             return

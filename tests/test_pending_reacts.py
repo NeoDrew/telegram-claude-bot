@@ -116,6 +116,7 @@ def run(inbox, reacts, events, markers=()):
     mod.TELEGRAM_CHAT_ID = CHAT
     mod.API_URL = "https://api.telegram.org/botfake-token"
     mod.EDIT_INTERVAL = 0.0
+    mod.GROUP_EDIT_INTERVAL = 0.0
     mod.bot_config.notify_cmd = lambda: "/usr/bin/true"
     try:
         mod.main()

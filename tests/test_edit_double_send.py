@@ -102,6 +102,7 @@ def run_scenario():
     mod.TELEGRAM_CHAT_ID = chat_id
     mod.API_URL = "https://api.telegram.org/botfake-token"
     mod.EDIT_INTERVAL = 0.0
+    mod.GROUP_EDIT_INTERVAL = 0.0
     mod._log_sent = lambda mid: None
     # verbosity.edits defaults to "diff" already, but pin it explicitly so
     # this test doesn't silently stop covering the original bug if the

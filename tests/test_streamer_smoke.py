@@ -165,6 +165,7 @@ def run_test():
     mod.API_URL = "https://api.telegram.org/botfake-token"
     # Make edits fire on every call so the smoke test sees them all.
     mod.EDIT_INTERVAL = 0.0
+    mod.GROUP_EDIT_INTERVAL = 0.0
     # Stub out the on-disk sent_msgs.log writer. Previously the test ran
     # with TELEGRAM_CHAT_ID="0" and the real _log_sent dutifully created
     # state/rooms/0/sent_msgs.log on every test run, that ghost room

@@ -115,6 +115,7 @@ def main():
         mod.TELEGRAM_CHAT_ID = chat_id
         mod.API_URL = "https://api.telegram.org/botfake-token"
         mod.EDIT_INTERVAL = 0.0
+        mod.GROUP_EDIT_INTERVAL = 0.0
 
         mod.main()
 

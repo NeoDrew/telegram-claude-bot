@@ -151,6 +151,7 @@ def main():
     mod.TELEGRAM_CHAT_ID = "-100"
     mod.API_URL = "https://api.telegram.org/botfake-token"
     mod.EDIT_INTERVAL = 0.0
+    mod.GROUP_EDIT_INTERVAL = 0.0
     mod._log_sent = lambda mid: None
 
     # Timestamp the moment the turn's own "result" envelope is processed

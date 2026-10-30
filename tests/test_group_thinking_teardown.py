@@ -192,6 +192,7 @@ def run_scenario(label, event_gen, group_mode=True):
     mod.TELEGRAM_CHAT_ID = chat_id
     mod.API_URL = "https://api.telegram.org/botfake-token"
     mod.EDIT_INTERVAL = 0.0
+    mod.GROUP_EDIT_INTERVAL = 0.0
     mod._log_sent = lambda mid: None
 
     mod.main()

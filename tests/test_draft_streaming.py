@@ -81,6 +81,7 @@ def run_streamer(chat_id, draft_flag="auto", fail_drafts=False, reject_html_draf
     mod.TELEGRAM_CHAT_ID = str(chat_id)          # draft_mode() reads this dynamically
     mod.API_URL = "https://api.telegram.org/botfake-token"
     mod.EDIT_INTERVAL = 0.0                       # flush every frame so we see them all
+    mod.GROUP_EDIT_INTERVAL = 0.0
     mod.DRAFT_INTERVAL = 0.0
     mod._log_sent = lambda mid: None             # touch no on-disk state
     mod.main()
