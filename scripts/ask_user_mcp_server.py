@@ -46,7 +46,7 @@ EXPIRED_NOTE = ("\n\n⌛ <i>No answer within 5 minutes, so Claude carried on wit
 
 
 def question_text(prompt):
-    return f"<b>Claude needs your input:</b>\n\n{html_escape(prompt)}"
+    return f"<b>{html_escape(prompt)}</b>"
 
 
 def send_question(prompt, options):

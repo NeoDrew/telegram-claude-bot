@@ -42,7 +42,7 @@ QUESTION=$(printf '%s' "$PENDING_DATA" | python3 -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
-    print(d.get('prompt', '')[:150])
+    print(d.get('prompt', '')[:3500])
 except Exception:
     print('')
 " 2>/dev/null || echo "")
@@ -71,20 +71,23 @@ TMP_ANSWER="${ANSWER_FILE}.tmp.$$"
 printf '%s' "$ANSWER" > "$TMP_ANSWER"
 mv -f "$TMP_ANSWER" "$ANSWER_FILE"
 
-# Edit the Telegram question message to show the result and clear the keyboard.
+# Edit the Telegram question message in place: the question stays as it
+# was asked (bold), the choice is added underneath, the keyboard goes.
 if [[ -n "${CALLBACK_MSG_ID:-}" ]]; then
+  SAFE_Q=$(printf '%s' "$QUESTION" | python3 -c \
+    "import sys,html; print(html.escape(sys.stdin.read().strip()))" 2>/dev/null \
+    || printf '%s' "$QUESTION")
+  EDIT_TEXT=""
+  [[ -n "$SAFE_Q" ]] && EDIT_TEXT="<b>$SAFE_Q</b>
+
+"
   if [[ "$ANSWER" == "__skip__" ]]; then
-    EDIT_TEXT="<i>Question skipped.</i>"
+    EDIT_TEXT+="Skipped"
   else
     SAFE=$(printf '%s' "$ANSWER" | python3 -c \
       "import sys,html; print(html.escape(sys.stdin.read().strip()))" 2>/dev/null \
       || printf '%s' "$ANSWER")
-    SAFE_Q=$(printf '%s' "$QUESTION" | python3 -c \
-      "import sys,html; print(html.escape(sys.stdin.read().strip()))" 2>/dev/null \
-      || printf '%s' "$QUESTION")
-    EDIT_TEXT="<b>$SAFE</b>"
-    [[ -n "$SAFE_Q" ]] && EDIT_TEXT+="
-<i>$SAFE_Q</i>"
+    EDIT_TEXT+="Selected: $SAFE"
   fi
   CHAT_ID="$ROOM_CHAT_ID" "$REPO_ROOT/scripts/tg.sh" edit_html \
     "$CALLBACK_MSG_ID" "$EDIT_TEXT" >/dev/null 2>&1 || true

@@ -293,6 +293,8 @@ assert_contains "tap on an older question says expired" "$(tg_calls)" "expired"
 assert_no_file  "older tap does not answer the pending question" "$ROOM/.ask_user_answer"
 runCB "ask_answer __idx__1" 600
 assert_file_eq  "tap on the pending question answers it" "$ROOM/.ask_user_answer" "No"
+assert_contains "answered question keeps the bold question" "$(tg_calls)" "<b>Ship it?</b>"
+assert_contains "answered question adds Selected: answer"   "$(tg_calls)" "Selected: No"
 rm -f "$ROOM/.ask_user_pending.json" "$ROOM/.ask_user_answer"
 
 # ---- new lifecycle ------------------------------------------------------

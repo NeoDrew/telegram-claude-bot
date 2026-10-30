@@ -1014,13 +1014,15 @@ except Exception:
       SAFE_PROMPT=$(python3 -c "
 import json, sys, html
 try:
-    print(html.escape(json.load(open(sys.argv[1])).get('prompt','')[:150]))
+    print(html.escape(json.load(open(sys.argv[1])).get('prompt','')[:3500]))
 except Exception:
     print('')
 " "$PENDING_JSON" 2>/dev/null || echo "")
-      EDIT_TXT="<b>$SAFE_ANS</b>"
-      [[ -n "$SAFE_PROMPT" ]] && EDIT_TXT+="
-<i>$SAFE_PROMPT</i>"
+      EDIT_TXT=""
+      [[ -n "$SAFE_PROMPT" ]] && EDIT_TXT="<b>$SAFE_PROMPT</b>
+
+"
+      EDIT_TXT+="Answered: $SAFE_ANS"
       CHAT_ID="$chat_id" "$SCRIPTS/tg.sh" edit_html "$ASK_MSG_ID" "$EDIT_TXT" >/dev/null 2>&1 || true
     fi
     if [[ -n "${USER_MSG_ID:-}" ]]; then
