@@ -106,6 +106,7 @@ def run():
         "stream_to_telegram", os.path.join(SCRIPTS, "stream_to_telegram.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    sys.modules["stream_to_telegram"] = mod
     mod.TELEGRAM_BOT_TOKEN = "t"
     mod.TELEGRAM_CHAT_ID = chat
     mod.API_URL = "https://api.telegram.org/bott"
@@ -151,6 +152,23 @@ def main():
         failures.append("compact mode leaked tool arguments")
     else:
         print("ok: no commands or file paths shown")
+
+    mod = sys.modules.get("stream_to_telegram")
+    mem = "/Users/x/.claude/projects/p/memory/notes.md"
+    checks = {
+        mod._compact_item("Write", {"file_path": mem}): "🧠 Memory",
+        mod._compact_item("Read", {"file_path": "/tmp/a.py"}): "📖 Read",
+        mod._compact_item("ScheduleWakeup", {}): "⏰ ScheduleWakeup",
+        mod._compact_item("mcp__plugin_vercel_vercel__list_projects", {}): "🔌 list_projects",
+        mod._compact_item("SomethingNew", {}): "🛠 SomethingNew",
+    }
+    bad = {got: want for got, want in checks.items() if got != want}
+    if bad:
+        failures.append(f"icons wrong (got: want) {bad}")
+    else:
+        print("ok: memory, known, MCP and unknown tools get the right icons")
+    if not mod._tool_line("Edit", {"file_path": mem}).startswith("🧠 *Memory*"):
+        failures.append("full marker for a memory edit should read 🧠 Memory")
 
     import verbosity
     d = tempfile.mkdtemp()

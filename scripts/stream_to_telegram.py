@@ -1226,10 +1226,9 @@ def _compact_add(item: str) -> None:
     _marker_queue.put(_edit)
 
 
-def _compact_item(name: str) -> str:
-    short = _short_tool_name(name)
-    glyph = TOOL_GLYPHS.get(name) or TOOL_GLYPHS.get(short) or "🛠"
-    return f"{glyph} {short}"
+def _compact_item(name: str, inp: dict | None = None) -> str:
+    glyph, label = _tool_glyph_label(name, inp)
+    return f"{glyph} {label}"
 
 
 # One-line inline marker emoji for each tool. Anything not listed falls
@@ -1246,17 +1245,41 @@ TOOL_GLYPHS = {
     "Glob": "🔎",
     "Grep": "🔎",
     "WebFetch": "🌐",
-    "WebSearch": "🌐",
+    "WebSearch": "🔍",
     "Task": "🤖",
     "Agent": "🤖",
+    "SendMessage": "💬",
+    "ListAgents": "🤖",
+    "Workflow": "🔀",
+    "Skill": "🪄",
+    "ToolSearch": "🧰",
     "TodoWrite": "✅",
+    "TaskCreate": "✅",
+    "TaskUpdate": "✅",
+    "TaskList": "✅",
+    "TaskGet": "✅",
+    "TaskOutput": "📤",
+    "TaskStop": "🛑",
+    "ScheduleWakeup": "⏰",
+    "CronCreate": "⏰",
+    "CronList": "⏰",
+    "CronDelete": "⏰",
+    "Monitor": "👁",
+    "PushNotification": "🔔",
+    "RemoteTrigger": "📡",
+    "EnterWorktree": "🌳",
+    "ExitWorktree": "🌳",
+    "ReportFindings": "🧾",
+    "DesignSync": "🎨",
     "NotebookEdit": "📓",
     "BashOutput": "⚙️",
     "KillShell": "⚙️",
+    "ask_user": "❓",
     # Browser MCP plugin (e.g. chromeflow) short names, looked up after
     # stripping the MCP prefix.
     "open_page": "🌐",
     "click_element": "🖱",
+    "click_at_coordinates": "🖱",
     "wait_for_click": "🖱",
     "type_text": "⌨️",
     "fill_input": "⌨️",
@@ -1278,6 +1301,7 @@ TOOL_GLYPHS = {
     "download_file": "⬇️",
     "fetch_url": "🌐",
     "scroll_to_element": "📜",
+    "scroll_page": "📜",
     "get_form_fields": "📋",
     "get_console_logs": "🔍",
     "inspect_request_headers": "🔍",
@@ -1289,6 +1313,29 @@ TOOL_GLYPHS = {
 }
 
 _MCP_CHROMEFLOW_PREFIX = "mcp__plugin_chromeflow_chromeflow__"
+
+# Unknown tools: 🔌 for any MCP server's tool, 🛠 for anything else.
+MCP_GLYPH = "🔌"
+OTHER_GLYPH = "🛠"
+MEMORY_GLYPH = "🧠"
+
+
+def _is_memory_path(path) -> bool:
+    """Claude Code's memory files live in ~/.claude/.../memory/."""
+    p = str(path or "")
+    return "/.claude/" in p and "/memory/" in p
+
+
+def _tool_glyph_label(name: str, inp: dict | None = None):
+    """(glyph, label) for a tool call. Reading or writing a memory file
+    shows as 🧠 Memory rather than a plain Read/Edit/Write."""
+    short = _short_tool_name(name)
+    if (short in ("Read", "Edit", "Write", "MultiEdit")
+            and _is_memory_path((inp or {}).get("file_path"))):
+        return MEMORY_GLYPH, "Memory"
+    glyph = (TOOL_GLYPHS.get(name) or TOOL_GLYPHS.get(short)
+             or (MCP_GLYPH if name.startswith("mcp__") else OTHER_GLYPH))
+    return glyph, short
 
 
 def _short_tool_name(name: str) -> str:
@@ -1412,8 +1459,7 @@ def _tool_line(name: str, inp: dict | None = None) -> str:
     special chars (quotes, brackets, &) don't have to be escaped here,
     md_to_telegram_html handles the rest.
     """
-    short = _short_tool_name(name)
-    glyph = TOOL_GLYPHS.get(name) or TOOL_GLYPHS.get(short) or "🛠"
+    glyph, short = _tool_glyph_label(name, inp)
     preview = _tool_preview(name, inp or {})
     if preview:
         return f"{glyph} *{short}*\n`{preview}`"
@@ -1490,7 +1536,8 @@ def _format_edit_tool(name: str, inp: dict) -> str | None:
         # a deleted line in a diff.
         return "".join(c + STRIKE for c in f"- {line}")
 
-    body_parts = [f"📝 *{name}* `{short_path}`", ""]
+    glyph = MEMORY_GLYPH if _is_memory_path(inp.get("file_path")) else "📝"
+    body_parts = [f"{glyph} *{name}* `{short_path}`", ""]
 
     if name == "Write":
         # Full new content: no diff, just the new body in a code block.
@@ -2573,7 +2620,7 @@ def main():
                             if tb["name"] == "ask_user":
                                 _compact_close()   # its question comes next
                             else:
-                                _compact_add(_compact_item(tb["name"]))
+                                _compact_add(_compact_item(tb["name"], inp))
                             continue
                         if is_edit and _verbosity.get("edits") == "diff":
                             continue
