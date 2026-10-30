@@ -53,6 +53,7 @@ run_one "streamer     (repo smoke)"  "$PY" tests/test_streamer_smoke.py
 run_one "group thinking teardown"    "$PY" tests/test_group_thinking_teardown.py
 run_one "group silent-drop salvage"  "$PY" tests/test_group_silent_drop.py
 run_one "edit no double-send (unit)" "$PY" tests/test_edit_double_send.py
+run_one "compact tool calls (unit)" "$PY" tests/test_compact_tools.py
 run_one "draft stream (unit)"        "$PY" tests/test_draft_streaming.py
 run_one "thinking narration (unit)"  "$PY" tests/test_thinking_narration.py
 run_one "compact completion (unit)"  "$PY" tests/test_compact_completion.py

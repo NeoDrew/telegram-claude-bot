@@ -29,8 +29,8 @@
     BODY="**🔊 Verbosity**
 
 What gets streamed back during a claude turn:
-• **Tool calls**: inline markers like ⚙️ Bash, 📖 Read
-• **Edits**: file changes (Edit/Write/MultiEdit); _diff_ sends the red/green block, _marker only_ just shows 📝 in the live message, _hidden_ suppresses both
+• **Tool calls**: _full_ sends each one with its command or file, _compact_ lists just the names in one message (⚙️ Bash, ⚙️ Bash, 📖 Read)
+• **Edits**: file changes (Edit/Write/MultiEdit); _full diff_ sends the red/green block, _marker only_ just names the file, _compact_ adds 📝 Edit to the compact list
 • **Thinking**: the \"💭 Thinking…\" placeholder at turn start
 
 Current: $SUMMARY"

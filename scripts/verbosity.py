@@ -3,8 +3,8 @@
 
 Schema (state/rooms/<chat>/verbosity, JSON):
     {
-      "tool_calls": "on" | "off",
-      "edits":      "diff" | "marker" | "off",
+      "tool_calls": "on" | "compact",
+      "edits":      "diff" | "marker" | "compact",
       "thinking":   "on" | "off"
     }
 
@@ -15,11 +15,16 @@ the verbosity screen.
 Independence rule: the three keys gate three distinct outputs and don't cross
 over. In particular `edits` controls BOTH the inline 📝 marker (in the live
 message buffer) AND the separate diff message, on this scale:
-    edits=diff   → marker AND separate diff
-    edits=marker → marker only, no separate diff
-    edits=off    → neither
-`tool_calls` only affects NON-edit tool markers (⚙️/📖/🔎/...); it doesn't
-silence edits because the user can express that with `edits=off`.
+    edits=diff    → marker AND separate diff
+    edits=marker  → marker only, no separate diff
+    edits=compact → just "📝 Edit" in the compact line (below)
+`tool_calls` only affects NON-edit tool markers (⚙️/📖/🔎/...).
+
+"compact" (either key) drops the arguments and lists the tools in one
+message, "⚙️ Bash, ⚙️ Bash, 📝 Edit", edited as more arrive, until Claude
+writes text; the next tools start a new line under that text. It replaced
+"off": hiding tools left nothing to show Claude was working. A stored
+"off" reads as "compact".
 
 Used by:
     - scripts/commands/verbosity.sh: CLI driver for the menu screen
@@ -32,8 +37,8 @@ from pathlib import Path
 
 DEFAULTS = {"tool_calls": "on", "edits": "diff", "thinking": "on"}
 VALID = {
-    "tool_calls": ("on", "off"),
-    "edits":      ("diff", "marker", "off"),
+    "tool_calls": ("on", "compact"),
+    "edits":      ("diff", "marker", "compact"),
     "thinking":   ("on", "off"),
 }
 
@@ -56,6 +61,8 @@ def load(repo_root: str | Path, chat_id: str | int) -> dict:
     out = dict(DEFAULTS)
     if isinstance(raw, dict):
         for k, v in raw.items():
+            if k in ("tool_calls", "edits") and v == "off":
+                v = "compact"   # the old "hidden" setting
             if k in VALID and v in VALID[k]:
                 out[k] = v
     return out
@@ -86,8 +93,8 @@ def set_key(repo_root: str | Path, chat_id: str | int,
 
 # ── Display labels for the menu screen ──────────────────────────────────────
 LABELS = {
-    "tool_calls": {"on": "shown", "off": "hidden"},
-    "edits":      {"diff": "full diff", "marker": "marker only", "off": "hidden"},
+    "tool_calls": {"on": "full", "compact": "compact"},
+    "edits":      {"diff": "full diff", "marker": "marker only", "compact": "compact"},
     "thinking":   {"on": "shown", "off": "hidden"},
 }
 HEADERS = {

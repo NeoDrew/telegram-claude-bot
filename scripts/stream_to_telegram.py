@@ -1184,6 +1184,53 @@ def _clear_wakeup_if_due():
 # when the matching tool_result arrives in the user event.
 _tool_call_mids: dict = {}
 
+# Compact verbosity: tools listed by name in ONE message ("⚙️ Bash, ⚙️ Bash,
+# 📝 Edit"), edited as more arrive. Closed by real text, a full marker or
+# diff, ask_user's question, or the end of the turn; the next compact tool
+# then starts a new message. Main thread only; the sends run on the marker
+# queue (one worker, FIFO), so an append always lands after its group's
+# first send and can read the mid that send stored.
+_cgroup: dict | None = None     # {"items": [...], "mid": None}
+COMPACT_MAX_CHARS = 3500        # start a new group well under 4096
+
+
+def _compact_close():
+    global _cgroup
+    _cgroup = None
+
+
+def _compact_add(item: str) -> None:
+    """Add one tool to the open compact group, or open a new one."""
+    global _cgroup
+    g = _cgroup
+    if g is not None and len(", ".join(g["items"] + [item])) > COMPACT_MAX_CHARS:
+        g = None
+    if g is None:
+        g = _cgroup = {"items": [item], "mid": None}
+        text = item
+
+        def _send(g=g, text=text):
+            g["mid"] = tg_send(text)
+            g["shown"] = 1
+        _bg_marker(_send)
+        return
+    g["items"].append(item)
+    n = len(g["items"])
+
+    def _edit(g=g, n=n):
+        # A later append already queued will show more; skip this one.
+        if not g.get("mid") or n < len(g["items"]) or g.get("shown", 0) >= n:
+            return
+        tg_edit(g["mid"], ", ".join(g["items"][:n]))
+        g["shown"] = n
+    _marker_queue.put(_edit)
+
+
+def _compact_item(name: str) -> str:
+    short = _short_tool_name(name)
+    glyph = TOOL_GLYPHS.get(name) or TOOL_GLYPHS.get(short) or "🛠"
+    return f"{glyph} {short}"
+
 
 # One-line inline marker emoji for each tool. Anything not listed falls
 # back to the wrench. The marker is appended to the live message buffer
@@ -2449,6 +2496,7 @@ def main():
                         if not chunk:
                             continue
                         clear_thinking()
+                        _compact_close()
                         if dtype == "thinking_delta" and thinking_sep_pending:
                             thinking_sep_pending = False
                             if _buf and not _buf.endswith("\n\n"):
@@ -2515,13 +2563,21 @@ def main():
                         # messages, the bare marker immediately followed by
                         # the diff.
                         is_edit = tb["name"] in EDIT_TOOL_NAMES
-                        suppress_marker = (
-                            (is_edit and _verbosity.get("edits") in ("off", "diff"))
+                        compact = (
+                            (is_edit and _verbosity.get("edits") == "compact")
                             or (not is_edit
-                                and _verbosity.get("tool_calls") == "off")
+                                and _verbosity.get("tool_calls") == "compact")
                         )
-                        if suppress_marker:
+                        if compact:
+                            commit_live(blocking=False)
+                            if tb["name"] == "ask_user":
+                                _compact_close()   # its question comes next
+                            else:
+                                _compact_add(_compact_item(tb["name"]))
                             continue
+                        if is_edit and _verbosity.get("edits") == "diff":
+                            continue
+                        _compact_close()
                         line = _tool_line(tb["name"], inp)
                         # Every tool marker is its own Telegram message.
                         # commit_live() handles the "💭 Thinking…" placeholder
@@ -2612,6 +2668,7 @@ def main():
                         inp_data = cb.get("input") or {}
                         diff_msg = _format_edit_tool(name, inp_data)
                         if diff_msg:
+                            _compact_close()
                             # Finalise the current live box first so the
                             # diff arrives as its own clean message below.
                             # blocking=False: mid-turn, same reasoning as the
@@ -2664,6 +2721,7 @@ def main():
             elif evtype == "result":
                 # Final result envelope. Finalise whatever we have.
                 commit_live()
+                _compact_close()
                 finalized = True
                 # Before the footer: clear any "💭 Thinking…" bubble whose
                 # delete was skipped by a 429 cooldown earlier in the turn.
