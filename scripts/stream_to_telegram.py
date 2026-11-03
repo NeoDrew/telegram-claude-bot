@@ -438,7 +438,8 @@ def ctx_pct_from_result(ev: dict):
 
 
 _RATE_LIMIT_KEYWORDS = ("429", "rate limit", "rate_limit", "usage limit",
-                        "overloaded", "usage_limit_reached", "session limit")
+                        "overloaded", "usage_limit_reached", "session limit",
+                        "weekly limit")
 
 _LIMIT_LABELS: dict[str, str] = {
     "five_hour": "5-hour session limit",
@@ -1194,9 +1195,33 @@ _cgroup: dict | None = None     # {"items": [...], "mid": None}
 COMPACT_MAX_CHARS = 3500        # start a new group well under 4096
 
 
+def _compact_sync(g: dict, final: bool = False) -> None:
+    """Bring a group's message up to date (marker queue only). tg_api skips
+    every call during a 429 cooldown, so a send or edit can simply not
+    happen. BUG FIXED: a tool added during a cooldown never appeared if no
+    later tool followed it. The group's last sync waits the cooldown out."""
+    for attempt in range(2 if final else 1):
+        n = len(g["items"])
+        if g.get("shown", 0) >= n:
+            return
+        text = ", ".join(g["items"][:n])
+        if g.get("mid"):
+            ok = tg_edit(g["mid"], text)
+        else:
+            g["mid"] = tg_send(text)
+            ok = bool(g["mid"])
+        if ok:
+            g["shown"] = n
+            return
+        if final and attempt == 0:
+            _wait_for_cooldown("compact tool list")
+
+
 def _compact_close():
     global _cgroup
-    _cgroup = None
+    g, _cgroup = _cgroup, None
+    if g is not None:
+        _marker_queue.put(lambda: _compact_sync(g, final=True))
 
 
 def _compact_add(item: str) -> None:
@@ -1204,25 +1229,19 @@ def _compact_add(item: str) -> None:
     global _cgroup
     g = _cgroup
     if g is not None and len(", ".join(g["items"] + [item])) > COMPACT_MAX_CHARS:
+        _compact_close()
         g = None
     if g is None:
         g = _cgroup = {"items": [item], "mid": None}
-        text = item
-
-        def _send(g=g, text=text):
-            g["mid"] = tg_send(text)
-            g["shown"] = 1
-        _bg_marker(_send)
+        _bg_marker(lambda g=g: _compact_sync(g))
         return
     g["items"].append(item)
     n = len(g["items"])
 
     def _edit(g=g, n=n):
         # A later append already queued will show more; skip this one.
-        if not g.get("mid") or n < len(g["items"]) or g.get("shown", 0) >= n:
-            return
-        tg_edit(g["mid"], ", ".join(g["items"][:n]))
-        g["shown"] = n
+        if n >= len(g["items"]):
+            _compact_sync(g)
     _marker_queue.put(_edit)
 
 
@@ -2763,8 +2782,16 @@ def main():
                 # Top-level assistant envelope. If we haven't streamed any
                 # text yet (e.g. partial-messages off), use this as fallback.
                 msg = ev.get("message") or {}
+                # Claude Code reports a usage limit as a made-up assistant
+                # message ("You've hit your weekly limit · resets 7pm") just
+                # before the error result. It is not a reply, and the result
+                # handler posts the "⏸ Rate limited" notice. BUG FIXED: both
+                # reached the chat.
+                _is_limit_notice = (
+                    msg.get("model") == "<synthetic>"
+                    and ev.get("error") == "rate_limit")
 
-                if not saw_text:
+                if not saw_text and not _is_limit_notice:
                     for cb in (msg.get("content") or []):
                         if cb.get("type") == "text":
                             t = cb.get("text", "")

@@ -54,6 +54,7 @@ run_one "group thinking teardown"    "$PY" tests/test_group_thinking_teardown.py
 run_one "group silent-drop salvage"  "$PY" tests/test_group_silent_drop.py
 run_one "edit no double-send (unit)" "$PY" tests/test_edit_double_send.py
 run_one "compact tool calls (unit)" "$PY" tests/test_compact_tools.py
+run_one "compact retry, one limit notice (unit)" "$PY" tests/test_compact_retry_limit_notice.py
 run_one "cache timer (unit)" "$PY" tests/test_cache_info.py
 run_one "cache cold footer (unit)" "$PY" tests/test_cache_cold.py
 run_one "draft stream (unit)"        "$PY" tests/test_draft_streaming.py
