@@ -182,7 +182,7 @@ Wire-through summary:
 
 To start a new conversation: create a Telegram group (or supergroup with a topic), add `@your_claude_bot`, set its privacy via BotFather (`/setprivacy → Disabled`) so it sees all messages, and talk to it. The first message creates `state/rooms/<group_chat_id>/` automatically. `/status` shows which room you're in.
 
-`notify-cmd` (`scripts/notify-cmd`, which `install.sh` links to `~/.local/bin/notify-cmd`; the bot itself calls whatever `NOTIFY_CMD` resolves to) is the ONLY phone notifier. It routes via `tg.sh` and therefore honours `CHAT_ID` (owner DM when unset), and supports `--tag`, `--photo`/`--caption`, stdin, `--dm` (force owner DM), and `--alert` (route to the global ALERTS channel, see below).
+`notify-cmd` (`scripts/notify-cmd`, which `install.sh` links to `~/.local/bin/notify-cmd`; the bot itself calls whatever `NOTIFY_CMD` resolves to) is the ONLY phone notifier. It routes via `tg.sh` and therefore honours `CHAT_ID` (owner DM when unset), and supports `--tag`, `--photo`/`--caption`, stdin, `--dm` (force owner DM), and `--alert` (route to the global ALERTS channel, see below). `--help` prints usage, and a lone unknown `--flag` fails instead of being sent. BUG FIXED: `notify-cmd --help` posted the word to the chat. Covered by `tests/test_notify_cmd_flags.sh`.
 
 The **alerts channel** is the one chat the owner keeps unmuted; every other room can be muted. It is bound from the 🚨 alerts menu button in a group room (stored at `state/.alerts_chat_id`, data not code, like `.owner_username`). `notify-cmd --alert` sends there, falling back to the owner DM when unbound. For urgent items see "Owner escalation" below: @mentions do NOT push through muted chats on phones, the alerts channel is the reliable path.
 

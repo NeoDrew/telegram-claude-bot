@@ -33,6 +33,7 @@ run_one "room_state   (unit)"        "$PY" tests/test_room_state.py
 run_one "approved_users (unit)"      "$PY" tests/test_approved_users.py
 run_one "md_telegram  (unit)"        "$PY" tests/test_md_telegram.py
 run_one "lib.sh       (helpers)"     bash tests/test_lib.sh
+run_one "notify-cmd flags"            bash tests/test_notify_cmd_flags.sh
 run_one "dispatch     (handlers)"    bash tests/test_dispatch.sh
 run_one "listener parse (unit)"      bash tests/test_listener_parse.sh
 run_one "wakeup rescue  (unit)"      bash tests/test_wakeup_rescue.sh
