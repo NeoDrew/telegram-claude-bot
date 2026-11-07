@@ -6,6 +6,11 @@ back live. Every Telegram chat (DM or group) it's added to becomes its own
 independent "room" with its own working directory, session, and settings, so
 you can run several project conversations in parallel from different chats.
 
+<p align="center">
+  <img src="docs/demo.gif" alt="Demo: asking the bot from a phone to look at the Telegram chat on the web, with the reply streaming back live" width="320">
+</p>
+<p align="center"><sub>A one minute session from a phone, played at 4x speed.</sub></p>
+
 ## Using it
 
 The bot is **menu-driven, not command-driven**. Send `/menu` (or `/start` in
