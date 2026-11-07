@@ -1,0 +1,110 @@
+# Architecture diagram for the README.
+# Render: d2 --pad 40 docs/architecture.d2 docs/architecture.svg
+# (D2 is open source: https://d2lang.com)
+
+vars: {
+  d2-config: {
+    layout-engine: dagre
+    theme-id: 4
+  }
+}
+
+direction: down
+
+classes: {
+  zone: {
+    style: {
+      border-radius: 16
+      font-size: 20
+      bold: true
+      stroke-width: 2
+    }
+  }
+  remote: {
+    style: {
+      border-radius: 16
+      font-size: 20
+      bold: true
+      stroke-width: 2
+      stroke-dash: 5
+    }
+  }
+  proc: {
+    style: {
+      border-radius: 10
+      stroke-width: 2
+      font-size: 15
+      shadow: true
+    }
+  }
+  hero: {
+    style: {
+      border-radius: 10
+      stroke-width: 3
+      font-size: 18
+      bold: true
+      shadow: true
+      fill: "#FFF4D6"
+      stroke: "#D97757"
+    }
+  }
+}
+
+phone: "📱 You, on your phone" {
+  class: zone
+  app: "Telegram app\nDMs, groups and forum topics" {class: proc}
+}
+
+telegram: "☁️ Telegram cloud" {
+  class: remote
+  api: "Bot API" {class: proc}
+}
+
+mac: "💻 Your Mac" {
+  class: zone
+
+  listener: "🎧 listener.sh\nlong-polls Telegram, kept alive by launchd" {class: proc}
+  actions: "☰ Menu actions\nhandle_action.sh + commands/" {class: proc}
+
+
+  room: "One room per chat, running in parallel" {
+    class: zone
+    style.font-size: 16
+    state: "🗂 Room state\ninbox, session, settings" {
+      shape: cylinder
+      style.font-size: 14
+    }
+    spawn: "🚀 spawn_claude.sh" {class: proc}
+    streamer: "📡 stream_to_telegram.py\nreplies stream in as Claude types" {class: proc}
+    claude: "✳️ Claude Code\none long-lived session" {class: hero}
+
+    state -> claude: "your messages\n(inbox.ndjson)"
+    spawn -> claude: "starts or resumes"
+    claude -> tools
+
+    tools: "🧰 Claude's hands" {
+      class: zone
+      grid-columns: 1
+      grid-gap: 18
+      style.font-size: 16
+      projects: "📁 Your project folders\nread, edit, run, commit" {class: proc}
+      browser: "🌐 Your Chrome\n(optional, via chromeflow)" {class: proc}
+      phone_tools: "🔔 notify-cmd + ask_user\nphotos, alerts, button questions" {class: proc}
+    }
+    claude -> streamer: "stream-json events"
+  }
+
+
+  listener -> actions: "button taps"
+  listener -> room: "your messages\n(wakes Claude if idle)"
+}
+
+anthropic: "✳️ Anthropic" {
+  class: remote
+  model: "Claude models\non your subscription" {class: proc}
+}
+
+phone.app <-> telegram.api: "messages, taps, photos, files"
+telegram.api -> mac.listener: "getUpdates\noutbound long-poll, no open ports"
+mac.room.streamer -> telegram.api: "live replies" {style.stroke: "#D97757"; style.stroke-width: 3}
+anthropic.model <-> mac.room.claude: "model calls"

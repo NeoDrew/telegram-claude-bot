@@ -49,6 +49,17 @@ next natural pause instead of getting lost.
 
 ## What's running
 
+<p align="center">
+  <img src="docs/architecture.svg" alt="Architecture: the Telegram app talks to the Telegram Bot API; on your Mac, listener.sh long-polls it and hands each chat's messages to its own persistent Claude Code session, whose replies stream back through stream_to_telegram.py" width="720">
+</p>
+
+Your phone never connects to your Mac directly. The Mac reaches out to
+Telegram with an outbound long poll, so no ports are opened. Each chat is its
+own room with its own Claude Code session, and replies stream back into the
+chat as Claude writes them. The diagram is drawn with
+[D2](https://d2lang.com); edit `docs/architecture.d2` and re-render with
+`d2 --pad 40 docs/architecture.d2 docs/architecture.svg`.
+
 A launchd daemon (label set by `BOT_LAUNCHD_LABEL` in `.env`, default `com.telegram-claude-bot`) running
 `scripts/listener.sh`, long-polling Telegram and dispatching each room's
 messages to its own Claude Code process. `KeepAlive=true`, so it restarts
