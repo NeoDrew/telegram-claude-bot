@@ -44,6 +44,7 @@ run_one "inject reaction (unit)"     "$PY" tests/test_spawn_state_reaction.py
 run_one "dashboard snapshot (unit)"  "$PY" tests/test_dashboard_snapshot.py
 run_one "pending reacts (unit)"      "$PY" tests/test_pending_reacts.py
 run_one "ask_user expiry (unit)"     "$PY" tests/test_ask_user_expiry.py
+run_one "ask_user send 429 (unit)"   "$PY" tests/test_ask_user_send_429.py
 run_one "nested fence (unit)"        "$PY" tests/test_nested_fence_in_edit_tool.py
 run_one "footer buttons (unit)"      "$PY" tests/test_turn_end_footer_buttons.py
 run_one "footer survives 429 (unit)" "$PY" tests/test_footer_survives_429.py

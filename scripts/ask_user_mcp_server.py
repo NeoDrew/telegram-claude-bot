@@ -14,7 +14,7 @@ Environment (set by spawn_claude.sh via --mcp-config env block):
                         Overridable so tests/e2e/ can point this at
                         fakes/fake_telegram_server.py.
 """
-import json, os, sys, time, pathlib, urllib.request, urllib.parse
+import json, os, sys, time, pathlib, urllib.error, urllib.request, urllib.parse
 
 ROOM_DIR  = pathlib.Path(os.environ["ROOM_DIR"])
 CHAT_ID   = os.environ["CHAT_ID"]
@@ -26,6 +26,12 @@ PENDING = ROOM_DIR / ".ask_user_pending.json"
 ANSWER  = ROOM_DIR / ".ask_user_answer"
 TIMEOUT = 300
 
+# How long send_question keeps retrying a rate-limited (429) send before
+# giving up. Telegram's group limit is about 20 messages a minute, and a busy
+# streamer in the same room can trip it; retry_after is usually 5 to 30s.
+SEND_RETRY_BUDGET_S = float(os.environ.get("ASK_USER_SEND_RETRY_S", "75"))
+
+
 def tg_post(endpoint, **kwargs):
     payload = {}
     for k, v in kwargs.items():
@@ -35,6 +41,12 @@ def tg_post(endpoint, **kwargs):
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        # Keep Telegram's error body (it carries retry_after on a 429).
+        try:
+            return json.loads(e.read())
+        except Exception:
+            return {"ok": False, "error_code": e.code}
     except Exception:
         return {}
 
@@ -59,18 +71,47 @@ def send_question(prompt, options):
     rows.append([{"text": "Skip / cancel question", "callback_data": "act:ask_answer __skip__"}])
     if not options:
         text += "\n\n<i>Reply with a message to answer.</i>"
-    resp = tg_post("sendMessage",
-                   chat_id=CHAT_ID,
-                   text=text,
-                   parse_mode="HTML",
-                   reply_markup={"inline_keyboard": rows})
-    return resp.get("result", {}).get("message_id") or 0
+    # Retry a rate-limited send after Telegram's retry_after, within a budget.
+    # BUG FIXED: a 429 used to be swallowed, so the question never appeared,
+    # yet the server still waited 5 minutes and took the user's next ordinary
+    # message as the answer.
+    deadline = time.monotonic() + SEND_RETRY_BUDGET_S
+    attempt = 0
+    while True:
+        attempt += 1
+        resp = tg_post("sendMessage",
+                       chat_id=CHAT_ID,
+                       text=text,
+                       parse_mode="HTML",
+                       reply_markup={"inline_keyboard": rows})
+        msg_id = (resp.get("result") or {}).get("message_id") or 0
+        if msg_id:
+            return msg_id
+        retry_after = (resp.get("parameters") or {}).get("retry_after")
+        if resp.get("error_code") == 429 and retry_after:
+            wait = float(retry_after) + 0.5
+        elif attempt < 3:
+            wait = 2.0  # network blip or a 5xx: try again shortly
+        else:
+            return 0
+        if time.monotonic() + wait > deadline:
+            return 0
+        time.sleep(wait)
+
+NOT_DELIVERED = ("[the question could not be delivered to Telegram (rate limited or "
+                 "network error), so the user has not seen it. Ask it in plain text "
+                 "in your reply instead.]")
+
 
 def handle_ask_user(arguments):
     prompt  = arguments.get("prompt", "")
     options = arguments.get("options") or []
 
     msg_id = send_question(prompt, options)
+    if not msg_id:
+        # Never wait on a question the user can't see: the listener would
+        # treat their next message as its answer.
+        return NOT_DELIVERED
     PENDING.write_text(json.dumps({
         "prompt": prompt,
         "options": options,
