@@ -119,6 +119,16 @@ if [[ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]]; then
   exit 2
 fi
 
+# Per-room API billing: if the room has an api_key file (chmod 600, one line,
+# an Anthropic Console key), this room bills the Console org's API credits
+# instead of the Max plan. Other rooms are untouched. Delete the file to
+# switch the room back.
+if [[ -s "$ROOM_DIR/api_key" ]]; then
+  ANTHROPIC_API_KEY=$(head -n1 "$ROOM_DIR/api_key" | tr -d '[:space:]')
+  export ANTHROPIC_API_KEY
+  unset CLAUDE_CODE_OAUTH_TOKEN
+fi
+
 # room_state.py owns the sessions.json schema (flat shape, legacy fallback,
 # default: the projects dir). All reads/writes below go through it.
 RS="$REPO_ROOT/scripts/room_state.py"
