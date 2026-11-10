@@ -88,7 +88,12 @@ macOS only for now (launchd, plus Quartz for the screenshot tools).
 ## Setup
 
 1. Create a bot via @BotFather, copy the token, and message it once.
-2. Generate a long-lived Claude OAuth token: `claude setup-token`.
+2. Generate a long-lived Claude OAuth token: `claude setup-token`. If the
+   Mac is also signed in to Claude Code normally (`claude auth login`), chats
+   use that login instead and keep the token as a fallback, because only a
+   real login brings in your claude.ai connectors (Gmail, Google Calendar,
+   Google Drive and anything else added at claude.ai under Settings,
+   Connectors). Set `BOT_CLAUDE_AUTH=token` to always use the token.
 3. `cp .env.example .env`, then fill in `TELEGRAM_BOT_TOKEN`,
    `TELEGRAM_CHAT_ID` and `CLAUDE_CODE_OAUTH_TOKEN`.
 4. `chmod 600 .env`.

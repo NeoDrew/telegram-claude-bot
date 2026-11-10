@@ -327,6 +327,12 @@ def _extract_inbox_text(raw_line):
 
 def main():
     args = sys.argv[1:]
+    if args[:2] == ["auth", "status"]:
+        # spawn_claude.sh asks which login to use. Report token auth (no
+        # claude.ai login) and touch no turn state, so scenarios still
+        # consume their scripted turns in order.
+        print(json.dumps({"loggedIn": True, "authMethod": "oauth_token"}, indent=2))
+        return
     persistent = any(a.startswith("--input-format=stream-json") for a in args)
     script = load_script()
     turns = turns_for_this_room(script)

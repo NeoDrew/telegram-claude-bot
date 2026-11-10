@@ -170,6 +170,21 @@ if [[ -z "$CLAUDE_BIN" ]]; then
   exit 4
 fi
 
+# Sign Claude in with the Mac's own claude.ai login when it has one, and keep
+# the .env token only as a fallback. The setup-token is inference only:
+# Claude Code loads no claude.ai connectors with it, so Gmail, Calendar,
+# Drive and anything else connected at claude.ai/settings/connectors were
+# invisible to every chat. BOT_CLAUDE_AUTH=token forces the old behaviour.
+if [[ "$(bot_config BOT_CLAUDE_AUTH login)" != "token" ]] \
+   && env -u CLAUDE_CODE_OAUTH_TOKEN "$CLAUDE_BIN" auth status 2>/dev/null \
+      | grep -q '"authMethod": *"claude.ai"'; then
+  unset CLAUDE_CODE_OAUTH_TOKEN
+  CLAUDE_AUTH_USED=login
+else
+  CLAUDE_AUTH_USED=token
+fi
+echo "$(date -u +%FT%TZ) auth=$CLAUDE_AUTH_USED chat=$ROOM_CHAT_ID" >> "$LOG"
+
 cd "$CWD" || exit 5
 
 # The assistant's name and optional persona are settings (README
