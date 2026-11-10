@@ -563,7 +563,7 @@ print(c.get('state', ''), int(c.get('transcript_age_s') or 0))
 # refresh_idle_stale_spawns: switch a stale spawn to current code once it
 # has sat idle between turns, instead of waiting for a message that lands
 # at an idle moment. BUG FIXED: a busy chat whose messages always arrived
-# mid-turn kept code from many hours earlier (integr8 kept the old full
+# mid-turn kept code from many hours earlier (one chat kept the old full
 # tool markers all day). The session is kept; the next message resumes it.
 # Only when Claude has read every inbox line (kill_room_spawn truncates the
 # inbox), nothing is queued, compacting or waiting on a question, and the
