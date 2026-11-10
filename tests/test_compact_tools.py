@@ -7,7 +7,8 @@ The user's example, replayed through the real streamer main() in a group
 chat (the edit path) with verbosity tool_calls=compact, edits=compact:
     Bash, Bash, Bash  ->  "Found a process..."  ->  Bash, Edit  ->  summary
 must show exactly:
-    "⚙️ Bash, ⚙️ Bash, ⚙️ Bash"   (one message, grown by edits)
+    "⚙️ Bash ×3"                  (one message, grown by edits; a run of
+                                   the same tool collapses into a count)
     "Found a process..."
     "⚙️ Bash, 📝 Edit"             (a NEW message)
     "Here's the summary"
@@ -139,7 +140,7 @@ def final_texts(calls):
 def main():
     failures = []
     texts = [t for t in final_texts(run()) if "Worked for" not in t and t != "…"]
-    want = ["⚙️ Bash, ⚙️ Bash, ⚙️ Bash",
+    want = ["⚙️ Bash ×3",
             "Found a process using 16% cpu, investigating",
             "⚙️ Bash, 📝 Edit",
             "Here is the summary of cpu"]
@@ -162,6 +163,17 @@ def main():
         mod._compact_item("mcp__plugin_vercel_vercel__list_projects", {}): "🔌 list_projects",
         mod._compact_item("SomethingNew", {}): "🛠 SomethingNew",
     }
+    runs = {
+        ("⚙️ Bash",): "⚙️ Bash",
+        ("⚙️ Bash",) * 5: "⚙️ Bash ×5",
+        ("⚙️ Bash", "⚙️ Bash", "📝 Edit", "⚙️ Bash"): "⚙️ Bash ×2, 📝 Edit, ⚙️ Bash",
+        ("📖 Read", "📖 Read", "📖 Read", "🔎 Grep", "🔎 Grep"): "📖 Read ×3, 🔎 Grep ×2",
+    }
+    for items, want_line in runs.items():
+        got_line = mod._compact_render(list(items))
+        if got_line != want_line:
+            failures.append(f"repeat count wrong for {items}: {got_line!r}, want {want_line!r}")
+    print("ok: back-to-back repeats collapse to a count, order kept")
     bad = {got: want for got, want in checks.items() if got != want}
     if bad:
         failures.append(f"icons wrong (got: want) {bad}")

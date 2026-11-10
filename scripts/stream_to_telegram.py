@@ -1195,6 +1195,19 @@ _cgroup: dict | None = None     # {"items": [...], "mid": None}
 COMPACT_MAX_CHARS = 3500        # start a new group well under 4096
 
 
+def _compact_render(items: list) -> str:
+    """Join a group's tools, collapsing a run of the same tool into one entry
+    with a count: "⚙️ Bash ×5, 📝 Edit". Only back-to-back repeats collapse,
+    so the line still reads in the order the tools ran."""
+    runs: list = []
+    for it in items:
+        if runs and runs[-1][0] == it:
+            runs[-1][1] += 1
+        else:
+            runs.append([it, 1])
+    return ", ".join(it if n == 1 else f"{it} ×{n}" for it, n in runs)
+
+
 def _compact_sync(g: dict, final: bool = False) -> None:
     """Bring a group's message up to date (marker queue only). tg_api skips
     every call during a 429 cooldown, so a send or edit can simply not
@@ -1204,7 +1217,7 @@ def _compact_sync(g: dict, final: bool = False) -> None:
         n = len(g["items"])
         if g.get("shown", 0) >= n:
             return
-        text = ", ".join(g["items"][:n])
+        text = _compact_render(g["items"][:n])
         if g.get("mid"):
             ok = tg_edit(g["mid"], text)
         else:
@@ -1228,7 +1241,7 @@ def _compact_add(item: str) -> None:
     """Add one tool to the open compact group, or open a new one."""
     global _cgroup
     g = _cgroup
-    if g is not None and len(", ".join(g["items"] + [item])) > COMPACT_MAX_CHARS:
+    if g is not None and len(_compact_render(g["items"] + [item])) > COMPACT_MAX_CHARS:
         _compact_close()
         g = None
     if g is None:
